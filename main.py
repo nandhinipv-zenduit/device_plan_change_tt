@@ -613,6 +613,9 @@ def build_xlsx(results):
     return buf.getvalue()
 
 
+_google = None
+
+
 def google_client():
     """One shared Google OAuth client (Drive + Gmail use the same refresh token)."""
     global _google
