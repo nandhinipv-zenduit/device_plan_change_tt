@@ -44,7 +44,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests python-dotenv
+        run: pip install requests python-dotenv openpyxl
 
       - name: Build command-line flags
         id: flags
@@ -65,6 +65,15 @@ jobs:
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          # ---- Links in the email ----
+          # Customer names link to Zoho CRM accounts (org id below). Serial numbers
+          # link to the device page when a template is set; placeholders available:
+          #   {serial} {device_id} {company_id} {database} {account} {crm_id}
+          # Leave a template empty for plain-text serials.
+          CRM_ORG_ID: "3130230"
+          GEOTAB_DEVICE_URL: ""      # e.g. https://myadmin.geotab.com/...{device_id}...
+          ZENDUIT_DEVICE_URL: ""     # e.g. https://admin.zendu.one/...{device_id}...
+          REPORT_TZ: America/Toronto # timezone for dates shown in the email
           # ---- Zoho Analytics ----
           ZOHO_ORG_ID: ${{ secrets.ZOHO_ORG_ID }}
           ZOHO_CLIENT_ID_ANALYTICS: ${{ secrets.ZOHO_CLIENT_ID_ANALYTICS }}
