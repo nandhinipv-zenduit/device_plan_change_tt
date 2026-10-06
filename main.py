@@ -76,13 +76,15 @@ WHAT A RUN DOES, IN ORDER
 .env (next to this script) or environment:
     ZOHO_ORG_ID, ZOHO_CLIENT_ID_ANALYTICS, ZOHO_CLIENT_SECRET_ANALYTICS,
     ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS,
-    SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO
+    EMAIL_FROM, EMAIL_TO, MAIL_VIA (gmail_api | smtp)
+    SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD   (smtp mode only)
     STORAGE (local | gdrive), DISCREPANCY_DIR (local mode), WORK_DIR (gdrive mode)
     GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN, GDRIVE_FOLDER_ID
     GEOTAB_BASELINE_NAME, ZENDUIT_BASELINE_NAME (optional; end in .gz to gzip)
     GEOTAB_VIEW_ID, ZENDUIT_VIEW_ID (optional, default to the IDs above)
     KEEP_BACKUPS (optional; 0 disables baseline_backups/), KEEP_REPORTS
 """
+import base64
 import csv
 import gzip
 import http.server
@@ -216,6 +218,10 @@ SMTP_PASS = env("SMTP_PASSWORD")
 MAIL_FROM = env("EMAIL_FROM", SMTP_USER)
 # A list, always. ", ".join("a@b.com") would spell the address out letter by letter.
 MAIL_TO = [a.strip() for a in env("EMAIL_TO", "billing@gofleet.com").split(",") if a.strip()]
+# How to send: gmail_api (HTTPS, uses the Google refresh token's gmail.send
+# permission) or smtp (app password). Defaults to the API whenever a Google
+# token is configured, because Gmail refuses SMTP logins from GitHub runners.
+MAIL_VIA = env("MAIL_VIA", "gmail_api" if GDRIVE_REFRESH_TOKEN else "smtp").lower()
 
 TD = "padding:5px 10px;border:1px solid #ccc"
 
@@ -426,10 +432,18 @@ def build_csv(changes):
     return buf.getvalue()
 
 
-def send_mail(subject, html, text, attachments=()):
-    """attachments: iterable of (filename, body_text)."""
-    if not (SMTP_USER and SMTP_PASS and MAIL_FROM and MAIL_TO):
-        die("SMTP_USERNAME / SMTP_PASSWORD / EMAIL_FROM / EMAIL_TO not set in .env")
+_google = None
+
+
+def google_client():
+    """One shared Google OAuth client (Drive + Gmail use the same refresh token)."""
+    global _google
+    if _google is None:
+        _google = DriveClient(GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN, log=say)
+    return _google
+
+
+def build_message(subject, html, text, attachments=()):
     msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = MAIL_FROM
@@ -442,11 +456,56 @@ def send_mail(subject, html, text, attachments=()):
         part = MIMEApplication(content.encode("utf-8"), Name=name)
         part["Content-Disposition"] = f'attachment; filename="{name}"'
         msg.attach(part)
+    return msg
+
+
+def send_via_gmail_api(msg):
+    """Send through the Gmail REST API with the Google refresh token (needs the
+    gmail.send permission, which `python main.py get-token` requests). HTTPS
+    only - no SMTP, no app password. Gmail drops SMTP logins coming from GitHub's
+    shared cloud addresses, which is exactly what killed the first run."""
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+    r = requests.post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                      headers={"Authorization": f"Bearer {google_client().token()}"},
+                      json={"raw": raw}, timeout=(30, 300))
+    if r.status_code >= 400:
+        hint = ""
+        if r.status_code == 403:
+            hint = ("\n   -> 403 usually means the token lacks the gmail.send permission "
+                    "(re-run `python main.py get-token`) or the Gmail API is not enabled "
+                    "in the Google Cloud project.")
+        raise RuntimeError(f"Gmail API send failed: {r.status_code} {r.text[:400]}{hint}")
+
+
+def send_via_smtp(msg):
+    if not (SMTP_USER and SMTP_PASS):
+        die("SMTP_USERNAME / SMTP_PASSWORD not set (or set MAIL_VIA=gmail_api with a Google token)")
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as s:
         s.starttls()
         s.login(SMTP_USER, SMTP_PASS)
         s.sendmail(MAIL_FROM, MAIL_TO, msg.as_string())
-    say(f"Emailed {', '.join(MAIL_TO)}")
+
+
+def send_mail(subject, html, text, attachments=()):
+    """attachments: iterable of (filename, body_text).
+
+    MAIL_VIA=gmail_api (default whenever a Google refresh token is configured)
+    sends through the Gmail API; MAIL_VIA=smtp uses SMTP with the app password.
+    If the API send fails and SMTP credentials exist, SMTP is tried as a fallback."""
+    if not (MAIL_FROM and MAIL_TO):
+        die("EMAIL_FROM / EMAIL_TO not set")
+    msg = build_message(subject, html, text, attachments)
+    if MAIL_VIA == "gmail_api":
+        try:
+            send_via_gmail_api(msg)
+            say(f"Emailed {', '.join(MAIL_TO)} (Gmail API)")
+            return
+        except Exception as exc:
+            if not SMTP_PASS:
+                raise
+            say(f"Gmail API send failed ({exc}); falling back to SMTP")
+    send_via_smtp(msg)
+    say(f"Emailed {', '.join(MAIL_TO)} (SMTP)")
 
 
 def report_note(result):
