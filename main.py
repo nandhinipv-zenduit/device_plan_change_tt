@@ -1,0 +1,1174 @@
+r"""
+Geotab + Zenduit plan-change check  (single file: python main.py)
+
+For each source (Geotab, Zenduit) compares the saved baseline table against
+the live Zoho Analytics view and emails every serial number whose plan
+differs. One email per run, Geotab section first, then Zenduit.
+
+    pip install requests python-dotenv
+    python main.py                 # the daily check
+    python main.py get-token       # one-off: mint the Google refresh token (Drive + Gmail send)
+    python main.py check-token     # one-off: test a refresh token against the Drive folder
+
+THE FILES ALWAYS LIVE IN GOOGLE DRIVE
+    My Drive\Device_discrepancy
+        Geotab_Devices.csv                      <- Geotab baseline (= previous run's table)
+        Zenduit_Devices.csv                     <- Zenduit baseline
+        plan_changes_geotab_<timestamp>.csv     <- one report per source per run
+        plan_changes_zenduit_<timestamp>.csv
+        compare_plans.log                       <- appended every run
+        baseline_backups\                       <- gzipped copies of each previous baseline
+
+TWO WAYS TO RUN IT (STORAGE in .env / workflow)
+
+  * STORAGE=gdrive  — GitHub Actions (see .github/workflows/plan-check.yml and
+    SETUP.md). The runner has no Drive mount, so the Drive section below downloads the
+    baselines and log from the Drive folder into a scratch folder first, the
+    run happens there unchanged, and afterwards everything the run changed or
+    created is uploaded back. Baselines are replaced in place, so the Drive
+    files keep their ids, owner and sharing. Needs GDRIVE_CLIENT_ID,
+    GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN and GDRIVE_FOLDER_ID.
+
+  * STORAGE=local (default) — a PC where Google Drive is mounted.
+    DISCREPANCY_DIR defaults to G:\My Drive\Device_discrepancy.
+
+    Never run both on a schedule at once: each run rolls the shared baseline
+    forward, so the second one that day would find nothing to report.
+
+    A baseline whose name ends in .gz is read and written gzipped (optional;
+    the defaults are plain CSV, as the folder has always held).
+
+SOURCES
+    Both views live in Analytics workspace 953790000013364003:
+        Geotab   view 953790000054827102   serial='serial…', plan='activeDevicePlan_name'
+        Zenduit  view 953790000054827175   serial='serial_number', plan='Plan'
+    Column names are matched by the lists in SOURCES below, with a fuzzy
+    fallback, and the columns actually picked are written to the log.
+
+NEVER-ACTIVATED DEVICES ARE EXCLUDED
+    A device with no plan on either side has never been provisioned, so it
+    appearing in or dropping out of the table is not a billing change. Those are
+    filtered out; the run log says how many. Terminations (a device that HAD a
+    plan and lost it) are still reported — that device was activated.
+    Pass --include-never-activated to see them anyway.
+
+WHAT A RUN DOES, IN ORDER
+    1. Pull the current table for every source from Zoho Analytics.
+    2. Compare each against its baseline CSV.
+    3. Write plan_changes_<source>_<timestamp>.csv for each source with changes.
+    4. Send ONE email with a section (and attachment) per source.
+    5. ONLY THEN: back up each old baseline (gzipped) and replace it with the
+       new data, so the next run compares against today.
+
+    Step 5 is last on purpose. If the email fails the script stops before it,
+    leaving every baseline alone — otherwise a failed send would erase changes
+    nobody had been told about, and no later run would ever report them.
+
+    A source whose baseline does not exist yet gets one written at step 5 and
+    is reported in the email as "baseline created, nothing to compare yet",
+    so adding Zenduit does not need a separate first-run step.
+
+    python main.py                        # the above
+    python main.py --no-update-baseline   # stop after step 4
+    python main.py --only geotab          # run a single source
+    python main.py --only zenduit
+
+.env (next to this script) or environment:
+    ZOHO_ORG_ID, ZOHO_CLIENT_ID_ANALYTICS, ZOHO_CLIENT_SECRET_ANALYTICS,
+    ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS,
+    SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO
+    STORAGE (local | gdrive), DISCREPANCY_DIR (local mode), WORK_DIR (gdrive mode)
+    GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN, GDRIVE_FOLDER_ID
+    GEOTAB_BASELINE_NAME, ZENDUIT_BASELINE_NAME (optional; end in .gz to gzip)
+    GEOTAB_VIEW_ID, ZENDUIT_VIEW_ID (optional, default to the IDs above)
+    KEEP_BACKUPS (optional; 0 disables baseline_backups/), KEEP_REPORTS
+"""
+import csv
+import gzip
+import http.server
+import io
+import json
+import os
+import secrets
+import shutil
+import smtplib
+import sys
+import threading
+import time
+import traceback
+import urllib.parse
+import webbrowser
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import requests
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+def env(name, default=""):
+    v = os.getenv(name)
+    return default if v is None or not v.strip() else v.strip()
+
+
+STORAGE = env("STORAGE", "local").lower()          # local | gdrive
+if STORAGE == "gdrive":
+    # Scratch folder on the runner. The Drive sync fills it before the run and
+    # uploads from it afterwards; everything else in this file just sees a
+    # normal local folder.
+    DISCREPANCY_DIR = env("WORK_DIR", os.path.join(os.getcwd(), "work"))
+    os.makedirs(DISCREPANCY_DIR, exist_ok=True)
+elif STORAGE == "local":
+    DISCREPANCY_DIR = env("DISCREPANCY_DIR", r"G:\My Drive\Device_discrepancy")
+else:
+    sys.exit(f"STORAGE must be 'local' or 'gdrive', not '{STORAGE}'")
+LOG_NAME = "compare_plans.log"
+LOG_PATH = os.path.join(DISCREPANCY_DIR, LOG_NAME)
+BACKUP_SUBDIR = "baseline_backups"
+
+GDRIVE_FOLDER_ID = env("GDRIVE_FOLDER_ID")
+GDRIVE_CLIENT_ID = env("GDRIVE_CLIENT_ID")
+GDRIVE_CLIENT_SECRET = env("GDRIVE_CLIENT_SECRET")
+GDRIVE_REFRESH_TOKEN = env("GDRIVE_REFRESH_TOKEN")
+# 0 (default): only the two baseline tables are read from / written to Drive.
+#              Reports, log and backups stay on the GitHub run as artifacts.
+# 1:           mirror reports, log and backups to Drive too (old PC layout).
+GDRIVE_SYNC_EXTRAS = env("GDRIVE_SYNC_EXTRAS", "0") == "1"
+
+# How many old baselines to keep PER SOURCE in baseline_backups/. Backups are
+# gzipped, but the exports are large and 20 copies of each is plenty, so they
+# are pruned oldest-first rather than left to fill the Drive. 0 = no backups.
+KEEP_BACKUPS = int(env("KEEP_BACKUPS", "20"))
+KEEP_REPORTS = int(env("KEEP_REPORTS", "200"))      # per source
+
+WORKSPACE_ID = env("ZOHO_ANALYTICS_WORKSPACE_ID", "953790000013364003")
+
+# One entry per device family. Order here is the order of the email sections
+# and of everything in the log: Geotab first, Zenduit second.
+#
+#   key            short id used in file names and --only
+#   label          what the email shows
+#   view_id        Analytics view to export
+#   baseline       baseline CSV name inside DISCREPANCY_DIR
+#   id_cols        (optional) column that uniquely identifies a device ROW.
+#                  When absent the serial number is the identity.
+#   serial_cols    column names tried in order for the serial number shown
+#                  in the email; the first non-blank value wins per row
+#   plan_cols      exact column names tried first for the plan
+#   customer_cols  exact column names tried first for the customer (optional)
+#   blank_plans    plan values that mean "no plan" (lower-cased)
+#
+# If none of the exact names exist, find_col falls back to a fuzzy match
+# (any column containing every word in the fuzzy list), so a renamed column in
+# Analytics does not kill the run — the log says which column got picked.
+SOURCES = [
+    {
+        "key": "geotab",
+        "label": "Geotab",
+        "view_id": env("GEOTAB_VIEW_ID", "953790000054827102"),
+        "baseline": env("GEOTAB_BASELINE_NAME", "Geotab_Devices.csv"),
+        "serial_cols": ["device_serialNumber", "serial", "Serial", "serialNumber", "Serial Number"],
+        "plan_cols": ["activeDevicePlan_name"],
+        "customer_cols": ["userContact_userCompany_name", "Customer", "Customer Name"],
+        "blank_plans": {""},
+    },
+    {
+        # The Zenduit table (checked against the real export, Oct 2026):
+        #   Device_Id      unique per row -> the identity. The same serial can
+        #                  appear under several companies (demo/test accounts),
+        #                  and ~6,000 rows carry a plan but no serial at all, so
+        #                  keying on serial would merge or drop real devices.
+        #   serial_number  the serial to show; 'Serial' is the fallback
+        #   Plan           e.g. 'ZenduONE - Enterprise', 'Terminated',
+        #                  'Suspended'. 'None' and '' both mean no plan.
+        #   Company_Name   the customer
+        "key": "zenduit",
+        "label": "Zenduit",
+        "view_id": env("ZENDUIT_VIEW_ID", "953790000054827175"),
+        "baseline": env("ZENDUIT_BASELINE_NAME", "Zenduit_Devices.csv"),
+        "id_cols": ["Device_Id", "device_id", "DeviceId"],
+        "serial_cols": ["serial_number", "Serial", "Serial Number", "serial", "serialNumber"],
+        "plan_cols": ["Plan", "plan", "plan_name", "Plan Name"],
+        "customer_cols": ["Company_Name", "Customer", "Customer Name", "customer",
+                          "customer_name", "Company", "company", "company_name"],
+        "blank_plans": {"", "none", "null"},
+    },
+]
+
+ORG_ID = env("ZOHO_ORG_ID", "67409019")
+A_ID = env("ZOHO_CLIENT_ID_ANALYTICS")
+A_SECRET = env("ZOHO_CLIENT_SECRET_ANALYTICS")
+A_REFRESH = env("ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS")
+
+SMTP_HOST = env("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(env("SMTP_PORT", "587"))
+# The password comes ONLY from the environment (.env locally, a repository
+# secret on GitHub). It must never be written into this file: the repo holds
+# customer data and the script, and a leaked Gmail app password is a full
+# mailbox login.
+SMTP_USER = env("SMTP_USERNAME", "nandhinipv@zenduit.com")
+SMTP_PASS = env("SMTP_PASSWORD")
+MAIL_FROM = env("EMAIL_FROM", SMTP_USER)
+# A list, always. ", ".join("a@b.com") would spell the address out letter by letter.
+MAIL_TO = [a.strip() for a in env("EMAIL_TO", "billing@gofleet.com").split(",") if a.strip()]
+
+TD = "padding:5px 10px;border:1px solid #ccc"
+
+
+def say(msg):
+    """Print AND append to a log file in the Drive folder.
+
+    A scheduled task has nowhere to print to, so without the file there is no
+    way to find out why a run did nothing. The log is in the synced folder on
+    purpose: you can read it from any machine.
+    """
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}"
+    print(line, flush=True)
+    try:
+        os.makedirs(DISCREPANCY_DIR, exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass  # never let logging break the run
+
+
+def die(msg):
+    say("ERROR: " + msg.replace("\n", "\n       "))
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------- reading CSVs
+
+def find_col(fieldnames, candidates, fuzzy, label, required=True):
+    for c in candidates:
+        if c in fieldnames:
+            return c
+    for name in fieldnames:
+        if all(t in (name or "").lower() for t in fuzzy):
+            return name
+    if required:
+        die(f"no '{label}' column. Columns found: {fieldnames}")
+    return ""
+
+
+def to_plan_map(text, source, label):
+    """device id -> (plan, customer, serial), using the columns configured for `source`.
+
+    The id is the serial number unless the source names an id column (Zenduit:
+    Device_Id). The serial is what the email shows; when a row has no serial
+    in any of the serial columns the id itself is shown instead."""
+    rows = list(csv.DictReader(io.StringIO(text)))
+    if not rows:
+        die(f"{label} has no rows.")
+    cols = list(rows[0].keys())
+    s_cols = [c for c in source["serial_cols"] if c in cols]
+    if not s_cols:
+        s_cols = [find_col(cols, [], ["serial"], "serial number")]
+    id_col = ""
+    if source.get("id_cols"):
+        id_col = find_col(cols, source["id_cols"], ["device", "id"], "device id", required=False)
+        if not id_col:
+            say(f"{label}: WARNING no id column {source['id_cols']} - keying on serial instead")
+    p_col = find_col(cols, source["plan_cols"], ["plan"], "plan")
+    c_col = (find_col(cols, source["customer_cols"], ["customer"], "customer", required=False)
+             or find_col(cols, [], ["company"], "customer", required=False))
+    blank_plans = source.get("blank_plans") or {""}
+
+    out, dropped, dups = {}, 0, 0
+    for r in rows:
+        serial = next((str(r.get(c) or "").strip() for c in s_cols if str(r.get(c) or "").strip()), "")
+        key = str(r.get(id_col) or "").strip() if id_col else serial
+        if not key:
+            dropped += 1                      # no identity at all: cannot be tracked
+            continue
+        plan = str(r.get(p_col) or "").strip()
+        if plan.lower() in blank_plans:
+            plan = ""
+        if key in out:
+            dups += 1
+        out[key] = (plan, str(r.get(c_col) or "").strip() if c_col else "", serial or key)
+    say(f"{label}: {len(out)} devices  (id='{id_col or s_cols[0]}', serial='{'/'.join(s_cols)}', "
+        f"plan='{p_col}', customer='{c_col or '-'}')")
+    if dropped:
+        say(f"{label}: {dropped} row(s) skipped - no id and no serial")
+    if dups:
+        say(f"{label}: {dups} duplicate id(s) - last row wins")
+    return out
+
+
+def strip_bom(text):
+    return text[1:] if text and text[0] == "\ufeff" else text
+
+
+def read_local_csv(path):
+    raw = open(path, "rb").read()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    return strip_bom(raw.decode("utf-8", "replace"))
+
+
+# ------------------------------------------------------------- Analytics
+
+def analytics_token():
+    if not (A_ID and A_SECRET and A_REFRESH):
+        die("missing Analytics credentials (ZOHO_CLIENT_ID_ANALYTICS, "
+            "ZOHO_CLIENT_SECRET_ANALYTICS, ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS) in .env")
+    r = requests.post("https://accounts.zoho.com/oauth/v2/token", data={
+        "grant_type": "refresh_token", "client_id": A_ID,
+        "client_secret": A_SECRET, "refresh_token": A_REFRESH}, timeout=60)
+    r.raise_for_status()
+    token = r.json().get("access_token")
+    if not token:
+        die(f"no Analytics access token: {r.text[:200]}")
+    return token
+
+
+def export_view(token, view_id, label):
+    """Run a bulk CSV export of one Analytics view and return its text."""
+    head = {"Authorization": f"Zoho-oauthtoken {token}", "ZANALYTICS-ORGID": ORG_ID}
+    base = f"https://analyticsapi.zoho.com/restapi/v2/bulk/workspaces/{WORKSPACE_ID}"
+
+    say(f"Analytics [{label}]: starting export of view {view_id}")
+    r = requests.get(f"{base}/views/{view_id}/data", headers=head, timeout=(10, 60),
+                     params={"CONFIG": json.dumps({"responseFormat": "csv"})})
+    if r.status_code >= 400:
+        die(f"Analytics [{label}] export job failed: {r.status_code} {r.text[:300]}")
+    job_id = (r.json().get("data") or {}).get("jobId")
+
+    deadline = time.time() + 900
+    while time.time() < deadline:
+        # The 2026-10-03 run died here on a single slow poll (ReadTimeout).
+        # One hiccup while the job is still cooking is not a failure: log it
+        # and poll again.
+        try:
+            r = requests.get(f"{base}/exportjobs/{job_id}", headers=head,
+                             params={"responseFormat": "json"}, timeout=(30, 60))
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            say(f"Analytics [{label}]: poll failed ({type(exc).__name__}), retrying")
+            time.sleep(10)
+            continue
+        info = r.json().get("data") or {}
+        if info.get("jobStatus") == "JOB COMPLETED" or str(info.get("jobCode")) == "1004":
+            say(f"Analytics [{label}]: export ready, downloading")
+            d = requests.get(info["downloadUrl"],
+                             headers={**head, "Accept-Encoding": "identity"}, timeout=(10, 900))
+            d.raise_for_status()
+            return strip_bom(d.text)
+        if str(info.get("jobCode")) in ("1003", "1005"):
+            die(f"Analytics [{label}] export failed: {info}")
+        time.sleep(3)
+    die(f"Analytics [{label}] export timed out after 15 minutes.")
+
+
+# ------------------------------------------------------------------ compare
+
+def compare(old, new, include_never_activated=False, label=""):
+    """Devices whose plan differs between the two datasets.
+
+    NEVER-ACTIVATED DEVICES ARE EXCLUDED. A device counts as never activated
+    when it has no plan on either side — it appears in one dataset and not the
+    other, and carries no plan in the one where it exists. Those are units
+    sitting in the table unprovisioned; them showing up or dropping off is not
+    a billing change and just buries the real ones.
+
+    What is NOT excluded, deliberately:
+      * a plan going value -> blank. That device WAS activated, and this is a
+        termination — exactly the kind of billing change worth an email.
+      * a plan going blank -> value. That is an activation.
+      * a new serial that arrives already carrying a plan.
+    """
+    changes = []
+    skipped = 0
+
+    # Each value is (plan, customer, serial); the dict key is the device identity
+    # (serial for Geotab, Device_Id for Zenduit). The email shows the serial.
+    for key, (new_plan, customer, serial) in new.items():
+        if key in old:
+            old_plan, old_customer, _ = old[key]
+            if old_plan != new_plan:
+                changes.append((serial, customer or old_customer,
+                                old_plan or "(none)", new_plan or "(none)"))
+        else:
+            # A device in the new data but not the old one. With a plan, that is
+            # an activation. Without one, it has never been activated at all.
+            if not new_plan and not include_never_activated:
+                skipped += 1
+                continue
+            changes.append((serial, customer, "(not in old file)", new_plan or "(none)"))
+
+    for key in set(old) - set(new):
+        old_plan, customer, serial = old[key]
+        if not old_plan and not include_never_activated:
+            skipped += 1
+            continue
+        changes.append((serial, customer, old_plan or "(none)", "(not in new data)"))
+
+    if skipped:
+        say(f"[{label}] Excluded {skipped} never-activated device(s) (no plan on either side). "
+            f"Pass --include-never-activated to see them.")
+    changes.sort(key=lambda c: (c[1], c[0]))
+    return changes
+
+
+# -------------------------------------------------------------------- email
+
+def build_csv(changes):
+    buf = io.StringIO(newline="")
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["serial_number", "customer", "old_plan", "new_plan"])
+    w.writerows(changes)
+    return buf.getvalue()
+
+
+def send_mail(subject, html, text, attachments=()):
+    """attachments: iterable of (filename, body_text)."""
+    if not (SMTP_USER and SMTP_PASS and MAIL_FROM and MAIL_TO):
+        die("SMTP_USERNAME / SMTP_PASSWORD / EMAIL_FROM / EMAIL_TO not set in .env")
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = subject
+    msg["From"] = MAIL_FROM
+    msg["To"] = ", ".join(MAIL_TO)
+    body = MIMEMultipart("alternative")
+    body.attach(MIMEText(text, "plain"))
+    body.attach(MIMEText(html, "html"))
+    msg.attach(body)
+    for name, content in attachments:
+        part = MIMEApplication(content.encode("utf-8"), Name=name)
+        part["Content-Disposition"] = f'attachment; filename="{name}"'
+        msg.attach(part)
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as s:
+        s.starttls()
+        s.login(SMTP_USER, SMTP_PASS)
+        s.sendmail(MAIL_FROM, MAIL_TO, msg.as_string())
+    say(f"Emailed {', '.join(MAIL_TO)}")
+
+
+def report_note(result):
+    """Footer line under a section: where the full CSV for that source is."""
+    if STORAGE == "gdrive":
+        return (f"Full list attached as plan_changes_{result['key']}.csv "
+                f"(also on the GitHub run page under Artifacts).")
+    return f"Report saved to {result['report_path']}"
+
+
+def section_html(result):
+    """One source's block of the email body."""
+    label = result["label"]
+    if result["first_run"]:
+        return (f"<h3 style='margin:18px 0 6px'>{label}</h3>"
+                f"<p>No baseline existed for {label}. Created <b>{result['baseline_name']}</b> "
+                f"with {result['count']} devices; nothing to compare yet. The next run will "
+                f"report changes against it.</p>")
+    changes = result["changes"]
+    if not changes:
+        return (f"<h3 style='margin:18px 0 6px'>{label}</h3>"
+                f"<p>No plan changes vs <b>{result['baseline_name']}</b>.</p>")
+    rows = "".join(
+        "<tr>"
+        f"<td style='{TD};font-family:monospace'>{s}</td>"
+        f"<td style='{TD}'>{c or '-'}</td>"
+        f"<td style='{TD}'>{o}</td>"
+        f"<td style='{TD};font-weight:600'>{n}</td>"
+        "</tr>" for s, c, o, n in changes[:500])
+    more = (f"<p>...and {len(changes) - 500} more. Full list is in the attached CSV.</p>"
+            if len(changes) > 500 else "")
+    th = f"{TD};text-align:left"
+    return (f"<h3 style='margin:18px 0 6px'>{label}</h3>"
+            f"<p><b>{len(changes)}</b> device(s) have a different plan than in "
+            f"<b>{result['baseline_name']}</b>.</p>"
+            f"<table style='border-collapse:collapse;font-size:13px'>"
+            f"<tr style='background:#eee'><th style='{th}'>Serial</th>"
+            f"<th style='{th}'>Customer</th><th style='{th}'>Old plan</th>"
+            f"<th style='{th}'>New plan</th></tr>{rows}</table>{more}"
+            f"<p style='color:#777;font-size:11px'>{report_note(result)}</p>")
+
+
+def section_text(result):
+    label = result["label"]
+    if result["first_run"]:
+        return (f"== {label} ==\nNo baseline existed. Created {result['baseline_name']} with "
+                f"{result['count']} devices; nothing to compare yet.\n")
+    changes = result["changes"]
+    if not changes:
+        return f"== {label} ==\nNo plan changes vs {result['baseline_name']}.\n"
+    return (f"== {label} ==\n{len(changes)} device(s) changed plan vs {result['baseline_name']}:\n\n"
+            + "\n".join(f"  {s}  ({c or '-'})  {o} -> {n}" for s, c, o, n in changes)
+            + f"\n\n{report_note(result)}\n")
+
+
+def email_results(results):
+    """One email, a section per source in SOURCES order (Geotab, then Zenduit)."""
+    counts = ", ".join(f"{len(r['changes'])} {r['label']}" for r in results if not r["first_run"])
+    created = [r["label"] for r in results if r["first_run"]]
+    subject = f"Device plan changes - {counts}" if counts else "Device plan check"
+    if created:
+        subject += f" (baseline created: {', '.join(created)})"
+
+    html = ("<html><body style='font-family:sans-serif;font-size:14px'>"
+            + "".join(section_html(r) for r in results)
+            + "</body></html>")
+    text = "\n".join(section_text(r) for r in results)
+    attachments = [(f"plan_changes_{r['key']}.csv", build_csv(r["changes"]))
+                   for r in results if r["changes"]]
+    send_mail(subject, html, text, attachments)
+
+
+def email_failure(err):
+    """A scheduled job that dies quietly is worse than one that never ran."""
+    try:
+        text = ("The device plan-change check failed.\n\n"
+                f"{err}\n\nLog: {LOG_PATH}\n")
+        html = (f"<html><body style='font-family:sans-serif;font-size:14px'>"
+                f"<p><b>The device plan-change check failed.</b></p>"
+                f"<pre style='background:#f6f6f6;padding:10px;font-size:12px'>{err}</pre>"
+                f"<p style='color:#777;font-size:11px'>Log: {LOG_PATH}</p></body></html>")
+        send_mail("Device plan check FAILED", html, text)
+    except Exception:
+        say("Could not send the failure email either.")
+
+
+# ---------------------------------------------------------- baseline update
+
+def prune(directory, prefix, keep):
+    """Keep the newest `keep` files starting with `prefix`; delete the rest."""
+    try:
+        files = sorted(f for f in os.listdir(directory) if f.startswith(prefix))
+    except OSError:
+        return
+    for name in files[:-keep] if keep > 0 else files:
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError as exc:
+            say(f"Could not delete old file {name}: {exc}")
+    if len(files) > keep:
+        say(f"Pruned {len(files) - keep} old '{prefix}*' file(s), kept the newest {keep}.")
+
+
+def write_atomic(path, text):
+    """Write to a temp name, then move into place, so an interrupted run cannot
+    leave a half-written file — and Google Drive cannot sync a truncated one.
+    A path ending in .gz is written gzipped (git stores a 10x smaller file,
+    and read_local_csv reads either form)."""
+    tmp = path + ".tmp"
+    if path.lower().endswith(".gz"):
+        with gzip.open(tmp, "wt", encoding="utf-8", newline="", compresslevel=6) as fh:
+            fh.write(text)
+    else:
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+    os.replace(tmp, path)          # atomic on Windows and POSIX
+
+
+def baseline_stem(source):
+    """'Geotab_Devices.csv.gz' / 'Geotab_Devices.csv' -> 'Geotab_Devices'."""
+    name = source["baseline"]
+    for ext in (".csv.gz", ".gz", ".csv"):
+        if name.lower().endswith(ext):
+            return name[:-len(ext)]
+    return os.path.splitext(name)[0]
+
+
+def update_baseline_file(source, baseline_path, new_text):
+    """Back up the current baseline, then replace it with the new data.
+
+    The backup is taken BEFORE anything is overwritten, every single time
+    (unless KEEP_BACKUPS=0, i.e. the folder is a git repo whose history already
+    keeps every version). A previous baseline was lost to a run that refreshed
+    it in place, which made the change it should have caught unrecoverable. A
+    gzipped copy costs almost nothing against that.
+    """
+    stem = baseline_stem(source)                            # e.g. Geotab_Devices
+    if KEEP_BACKUPS > 0:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        backup_dir = os.path.join(DISCREPANCY_DIR, BACKUP_SUBDIR)
+        os.makedirs(backup_dir, exist_ok=True)
+        backup = os.path.join(backup_dir, f"{stem}_{stamp}.csv.gz")
+        with open(baseline_path, "rb") as src:
+            raw = src.read()
+        if raw[:2] == b"\x1f\x8b":                            # already gzipped: copy as-is
+            with open(backup, "wb") as dst:
+                dst.write(raw)
+        else:
+            with gzip.open(backup, "wb", compresslevel=6) as dst:
+                dst.write(raw)
+        say(f"[{source['label']}] Backed up previous baseline -> {backup} "
+            f"({os.path.getsize(backup) / 1024 / 1024:.1f} MB gzipped)")
+        prune(backup_dir, f"{stem}_", KEEP_BACKUPS)
+    else:
+        say(f"[{source['label']}] KEEP_BACKUPS=0: no backup copy kept")
+
+    write_atomic(baseline_path, new_text)
+    say(f"[{source['label']}] Baseline updated: {baseline_path}")
+
+    prune(DISCREPANCY_DIR, f"plan_changes_{source['key']}_", KEEP_REPORTS)
+
+
+# --------------------------------------------------------------------- main
+
+def process_source(source, token, include_never):
+    """Steps 1-3 for one source. Returns a result dict; nothing is written to
+    the baseline here."""
+    label = source["label"]
+    baseline_path = os.path.join(DISCREPANCY_DIR, source["baseline"])
+    say(f"--- {label}: baseline {baseline_path}")
+
+    new_text = export_view(token, source["view_id"], label)
+    new = to_plan_map(new_text, source, f"NEW {label} (Analytics)")
+
+    result = {"key": source["key"], "label": label, "source": source,
+              "baseline_path": baseline_path, "baseline_name": source["baseline"],
+              "new_text": new_text, "count": len(new),
+              "first_run": False, "changes": [], "report_path": ""}
+
+    if not os.path.exists(baseline_path):
+        # First run for this source. Nothing to compare against; the baseline is
+        # laid down in the update step and the email says so plainly rather
+        # than reporting "no changes".
+        say(f"[{label}] No baseline found - will create {baseline_path} with {len(new)} devices.")
+        result["first_run"] = True
+        return result
+
+    old = to_plan_map(read_local_csv(baseline_path), source, f"OLD {label} ({source['baseline']})")
+    changes = compare(old, new, include_never_activated=include_never, label=label)
+    say(f"[{label}] {len(changes)} device(s) with a different plan")
+    for s, c, o, n in changes[:50]:
+        say(f"    {s}  ({c or '-'})  {o} -> {n}")
+    if len(changes) > 50:
+        say(f"    ... and {len(changes) - 50} more")
+
+    if changes:
+        report_path = os.path.join(
+            DISCREPANCY_DIR, f"plan_changes_{source['key']}_{time.strftime('%Y%m%d_%H%M')}.csv")
+        with open(report_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(build_csv(changes))
+        say(f"[{label}] Wrote {report_path}")
+        result["report_path"] = report_path
+    result["changes"] = changes
+    return result
+
+
+def run():
+    skip_update = "--no-update-baseline" in sys.argv
+    include_never = "--include-never-activated" in sys.argv
+
+    sources = SOURCES
+    if "--only" in sys.argv:
+        want = sys.argv[sys.argv.index("--only") + 1].lower()
+        sources = [s for s in SOURCES if s["key"] == want]
+        if not sources:
+            die(f"--only {want}: unknown source. Choose from "
+                + ", ".join(s["key"] for s in SOURCES))
+
+    say("=" * 60)
+    say(f"Folder:  {DISCREPANCY_DIR}")
+    say(f"Sources: {', '.join(s['label'] for s in sources)}")
+
+    if not os.path.isdir(DISCREPANCY_DIR):
+        die(f"the folder {DISCREPANCY_DIR} does not exist or is not reachable.\n"
+            "A mapped drive like G: only exists while Google Drive is running and you are "
+            "logged in. Tick 'Run only when user is logged on' in Task Scheduler, or point "
+            "DISCREPANCY_DIR at a real local path.")
+
+    token = analytics_token()
+    results = [process_source(s, token, include_never) for s in sources]
+
+    # ---- one email for everything, Geotab section first, Zenduit second ----
+    # If this raises, the script exits and no baseline below is touched — which
+    # is the point. Rolling a baseline forward after a failed send would erase
+    # the very changes nobody has been told about.
+    if any(r["changes"] or r["first_run"] for r in results):
+        email_results(results)
+    else:
+        say("No changes in any source - no email sent.")
+
+    # ---- baseline update, last thing, only after the email is safely away ----
+    for r in results:
+        if r["first_run"]:
+            # Always lay down a missing baseline, even with --no-update-baseline:
+            # without it the next run would have nothing to compare against.
+            write_atomic(r["baseline_path"], r["new_text"])
+            say(f"[{r['label']}] Created baseline {r['baseline_path']} with {r['count']} devices.")
+        elif skip_update:
+            say(f"[{r['label']}] --no-update-baseline: {r['baseline_path']} left unchanged. "
+                "The next run will report this same list again.")
+        else:
+            update_baseline_file(r["source"], r["baseline_path"], r["new_text"])
+
+
+# =============================================================================
+#  Google Drive storage (used when STORAGE=gdrive)
+# =============================================================================
+
+API = "https://www.googleapis.com/drive/v3"
+UPLOAD = "https://www.googleapis.com/upload/drive/v3"
+FOLDER_MIME = "application/vnd.google-apps.folder"
+# supportsAllDrives makes the same code work if the folder is ever moved into
+# a Shared Drive.
+COMMON = {"supportsAllDrives": "true"}
+
+
+class DriveError(RuntimeError):
+    pass
+
+
+# ----------------------------------------------------------------- low level
+
+class DriveClient:
+    """Thin wrapper over the Drive v3 REST API with a self-refreshing token."""
+
+    def __init__(self, client_id, client_secret, refresh_token, log=print):
+        if not (client_id and client_secret and refresh_token):
+            raise DriveError("GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET / GDRIVE_REFRESH_TOKEN not set")
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.refresh_token = refresh_token
+        self.log = log
+        self._token = None
+        self._token_expiry = 0
+
+    # -- auth --
+    def token(self):
+        if self._token and time.time() < self._token_expiry - 120:
+            return self._token
+        r = requests.post("https://oauth2.googleapis.com/token", data={
+            "grant_type": "refresh_token", "client_id": self.client_id,
+            "client_secret": self.client_secret, "refresh_token": self.refresh_token},
+            timeout=60)
+        if r.status_code >= 400:
+            raise DriveError(f"Google token refresh failed: {r.status_code} {r.text[:300]}\n"
+                             "If this says invalid_grant the refresh token was revoked or "
+                             "expired (an 'External / Testing' OAuth app expires tokens after "
+                             "7 days — the consent screen must be 'Internal'). Re-run "
+                             "`python main.py get-token` and update the GDRIVE_REFRESH_TOKEN secret.")
+        body = r.json()
+        self._token = body["access_token"]
+        self._token_expiry = time.time() + int(body.get("expires_in", 3600))
+        return self._token
+
+    def _headers(self, extra=None):
+        h = {"Authorization": f"Bearer {self.token()}"}
+        if extra:
+            h.update(extra)
+        return h
+
+    def _check(self, r, what):
+        if r.status_code >= 400:
+            raise DriveError(f"Drive {what} failed: {r.status_code} {r.text[:400]}")
+        return r
+
+    # -- read --
+    def list_folder(self, folder_id):
+        """Every non-trashed item directly inside folder_id: [{id,name,mimeType,size,modifiedTime}]."""
+        files, page_token = [], None
+        while True:
+            params = {**COMMON, "includeItemsFromAllDrives": "true", "pageSize": 1000,
+                      "q": f"'{folder_id}' in parents and trashed = false",
+                      "fields": "nextPageToken,files(id,name,mimeType,size,modifiedTime)"}
+            if page_token:
+                params["pageToken"] = page_token
+            r = self._check(requests.get(f"{API}/files", headers=self._headers(),
+                                         params=params, timeout=(10, 120)), "list")
+            body = r.json()
+            files.extend(body.get("files", []))
+            page_token = body.get("nextPageToken")
+            if not page_token:
+                return files
+
+    def download(self, file_id, local_path):
+        with requests.get(f"{API}/files/{file_id}", headers=self._headers(),
+                          params={**COMMON, "alt": "media"}, stream=True,
+                          timeout=(10, 900)) as r:
+            self._check(r, "download")
+            tmp = local_path + ".part"
+            with open(tmp, "wb") as fh:
+                for chunk in r.iter_content(1024 * 1024):
+                    fh.write(chunk)
+            os.replace(tmp, local_path)
+
+    # -- write --
+    def _resumable(self, method, url, metadata, local_path):
+        """Resumable upload in one shot. (Multipart uploads are capped at 5 MB,
+        which a device export can exceed; resumable has no such cap.)"""
+        size = os.path.getsize(local_path)
+        r = self._check(requests.request(
+            method, url, headers=self._headers({
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": "application/octet-stream",
+                "X-Upload-Content-Length": str(size)}),
+            params={**COMMON, "uploadType": "resumable",
+                    "fields": "id,name,size,modifiedTime"},
+            data=json.dumps(metadata), timeout=(10, 120)), "upload start")
+        session_url = r.headers.get("Location")
+        if not session_url:
+            raise DriveError("Drive upload start returned no session URL")
+        with open(local_path, "rb") as fh:
+            r = requests.put(session_url, headers={"Content-Type": "application/octet-stream",
+                                                   "Content-Length": str(size)},
+                             data=fh, timeout=(10, 1800))
+        return self._check(r, "upload").json()
+
+    def create_file(self, folder_id, name, local_path):
+        return self._resumable("POST", f"{UPLOAD}/files",
+                               {"name": name, "parents": [folder_id]}, local_path)
+
+    def update_file(self, file_id, local_path):
+        """Replace the content of an existing file. Keeps id, owner, sharing and
+        the file's own revision history in Drive."""
+        return self._resumable("PATCH", f"{UPLOAD}/files/{file_id}", {}, local_path)
+
+    def delete(self, file_id):
+        self._check(requests.delete(f"{API}/files/{file_id}", headers=self._headers(),
+                                    params=COMMON, timeout=(10, 60)), "delete")
+
+    def create_folder(self, parent_id, name):
+        r = self._check(requests.post(f"{API}/files", headers=self._headers(
+            {"Content-Type": "application/json; charset=UTF-8"}),
+            params={**COMMON, "fields": "id,name"},
+            data=json.dumps({"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}),
+            timeout=(10, 60)), "create folder")
+        return r.json()
+
+
+# ---------------------------------------------------------------- high level
+
+def _snapshot(directory):
+    """name -> (size, mtime) for the regular files directly in `directory`."""
+    out = {}
+    try:
+        for name in os.listdir(directory):
+            p = os.path.join(directory, name)
+            if os.path.isfile(p):
+                st = os.stat(p)
+                out[name] = (st.st_size, st.st_mtime)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def _by_name(items, log):
+    """name -> item, keeping the newest when Drive holds duplicates (Drive
+    allows two files with the same name in one folder; the sync does not)."""
+    out = {}
+    for it in sorted(items, key=lambda i: i.get("modifiedTime", "")):
+        if it["name"] in out:
+            log(f"Drive: duplicate name '{it['name']}' in folder - using the newest copy")
+        out[it["name"]] = it
+    return out
+
+
+class DriveSync:
+    def __init__(self, client, folder_id, work_dir, log=print,
+                 backup_subdir="baseline_backups"):
+        if not folder_id:
+            raise DriveError("GDRIVE_FOLDER_ID not set")
+        self.c = client
+        self.folder_id = folder_id
+        self.work_dir = work_dir
+        self.log = log
+        self.backup_subdir = backup_subdir
+        self._before = {}
+
+    def pull(self, names):
+        """Download the named files (baselines, log) into work_dir. A name that
+        does not exist on Drive is simply skipped — that is the first run."""
+        os.makedirs(self.work_dir, exist_ok=True)
+        remote = _by_name([i for i in self.c.list_folder(self.folder_id)
+                           if i.get("mimeType") != FOLDER_MIME], self.log)
+        for name in names:
+            it = remote.get(name)
+            if not it:
+                self.log(f"Drive: '{name}' not in folder (will be created on push)")
+                continue
+            self.c.download(it["id"], os.path.join(self.work_dir, name))
+            self.log(f"Drive: downloaded {name} ({int(it.get('size') or 0) / 1024 / 1024:.1f} MB)")
+        self._before = _snapshot(self.work_dir)
+
+    def push(self, keep_backups=0, keep_report_prefixes=(), keep_reports=0, only=None):
+        """Upload every file in work_dir that is new or changed since pull(),
+        mirror new backups into the backups subfolder, then prune on Drive.
+
+        only: an iterable of file names. When given, ONLY those names are ever
+        uploaded and nothing else is created, mirrored or pruned on Drive —
+        used to keep the Drive folder down to just the baseline tables."""
+        after = _snapshot(self.work_dir)
+        changed = [n for n, sig in after.items()
+                   if not n.endswith((".tmp", ".part")) and self._before.get(n) != sig]
+        if only is not None:
+            only = set(only)
+            changed = [n for n in changed if n in only]
+        if not changed:
+            self.log("Drive: nothing changed, nothing to upload")
+        items = self.c.list_folder(self.folder_id)
+        remote = _by_name([i for i in items if i.get("mimeType") != FOLDER_MIME], self.log)
+        for name in sorted(changed):
+            path = os.path.join(self.work_dir, name)
+            if name in remote:
+                self.c.update_file(remote[name]["id"], path)
+                self.log(f"Drive: updated  {name}")
+            else:
+                self.c.create_file(self.folder_id, name, path)
+                self.log(f"Drive: uploaded {name}")
+
+        if only is not None:
+            return                      # baselines only: no backups, reports or pruning on Drive
+
+        # backups: anything in work_dir/baseline_backups is new this run
+        local_backups = os.path.join(self.work_dir, self.backup_subdir)
+        new_backups = sorted(_snapshot(local_backups))
+        folders = {i["name"]: i for i in items if i.get("mimeType") == FOLDER_MIME}
+        backup_folder = folders.get(self.backup_subdir)
+        if new_backups:
+            if not backup_folder:
+                backup_folder = self.c.create_folder(self.folder_id, self.backup_subdir)
+                self.log(f"Drive: created folder {self.backup_subdir}/")
+            for name in new_backups:
+                self.c.create_file(backup_folder["id"], name, os.path.join(local_backups, name))
+                self.log(f"Drive: uploaded {self.backup_subdir}/{name}")
+
+        # prune on Drive, mirroring prune() above
+        for prefix in keep_report_prefixes:
+            self._prune(self.folder_id, prefix, keep_reports)
+        if backup_folder and keep_backups > 0:
+            for prefix in self._backup_prefixes(new_backups):
+                self._prune(backup_folder["id"], prefix, keep_backups)
+
+    @staticmethod
+    def _backup_prefixes(names):
+        """'Geotab_Devices_20261006_043000.csv.gz' -> 'Geotab_Devices_'."""
+        out = set()
+        for n in names:
+            stem = n.rsplit("_", 2)[0] if n.count("_") >= 2 else n
+            out.add(stem + "_")
+        return sorted(out)
+
+    def _prune(self, folder_id, prefix, keep):
+        if keep <= 0:
+            return
+        items = sorted((i for i in self.c.list_folder(folder_id)
+                        if i.get("mimeType") != FOLDER_MIME and i["name"].startswith(prefix)),
+                       key=lambda i: i["name"])          # names carry the timestamp
+        for it in items[:-keep]:
+            try:
+                self.c.delete(it["id"])
+            except DriveError as exc:
+                self.log(f"Drive: could not delete {it['name']}: {exc}")
+        if len(items) > keep:
+            self.log(f"Drive: pruned {len(items) - keep} old '{prefix}*' file(s), kept the newest {keep}")
+
+
+# --------------------------------------------------------------------- main
+
+def make_drive_sync():
+    """Only used when STORAGE=gdrive."""
+    client = DriveClient(GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN, log=say)
+    return DriveSync(client, GDRIVE_FOLDER_ID, DISCREPANCY_DIR, log=say,
+                     backup_subdir=BACKUP_SUBDIR)
+
+
+def main():
+    sync = None
+    exit_code = 0
+    try:
+        if STORAGE == "gdrive":
+            sync = make_drive_sync()
+            say("=" * 60)
+            say(f"Drive: pulling baselines and log from folder {GDRIVE_FOLDER_ID}")
+            baselines = [s["baseline"] for s in SOURCES]
+            sync.pull(baselines + ([LOG_NAME] if GDRIVE_SYNC_EXTRAS else []))
+        run()
+    except SystemExit as exc:            # die() — already logged
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+    except Exception:
+        err = traceback.format_exc()
+        say("UNHANDLED ERROR:\n" + err)
+        email_failure(err)
+        exit_code = 1
+    finally:
+        # Push whatever the run produced — including the log line that explains a
+        # failure. On a failed run the baselines were never rewritten, so only
+        # the log (and any report already written) goes back up.
+        if sync is not None:
+            try:
+                sync.push(keep_backups=KEEP_BACKUPS,
+                          keep_report_prefixes=[f"plan_changes_{s['key']}_" for s in SOURCES],
+                          keep_reports=KEEP_REPORTS,
+                          only=None if GDRIVE_SYNC_EXTRAS else [s["baseline"] for s in SOURCES])
+            except Exception:
+                err = traceback.format_exc()
+                say("Drive: upload back to Drive FAILED:\n" + err)
+                # Worth its own alert: the email went out but the Drive baseline
+                # did not move, so tomorrow's run will repeat today's list.
+                email_failure("Upload back to Google Drive failed after the run. The baseline "
+                              "in Drive was NOT updated, so the next run will report the same "
+                              "changes again.\n\n" + err)
+                exit_code = exit_code or 1
+    sys.exit(exit_code)
+
+
+# =============================================================================
+#  One-off helpers:  python main.py get-token   |   python main.py check-token
+# =============================================================================
+
+def ask(name, prompt):
+    return os.getenv(name) or input(prompt).strip()
+
+
+# One token, two permissions: Drive (this job) and Gmail send (so the same
+# token can replace the Gmail-only one in other scripts). Add more with the
+# EXTRA_SCOPES environment variable, space-separated.
+SCOPES = ["https://www.googleapis.com/auth/drive",
+          "https://www.googleapis.com/auth/gmail.send"]
+SCOPES += os.getenv("EXTRA_SCOPES", "").split()
+SCOPE = " ".join(SCOPES)
+# Must match an "Authorized redirect URI" on the OAuth client exactly. Set
+# OAUTH_PORT to reuse one the client already has, e.g. http://localhost:8080/.
+PORT = int(os.getenv("OAUTH_PORT", "8765"))
+REDIRECT = f"http://localhost:{PORT}/"
+
+
+
+def cmd_get_token():
+    client_id = ask("GDRIVE_CLIENT_ID", "OAuth client id: ")
+    client_secret = ask("GDRIVE_CLIENT_SECRET", "OAuth client secret: ")
+    state = secrets.token_urlsafe(16)
+    got = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            if q.get("state", [""])[0] != state or "code" not in q:
+                self.wfile.write(b"<h2>Something went wrong. Go back to the terminal.</h2>")
+                got["error"] = q.get("error", ["no code returned"])[0]
+            else:
+                self.wfile.write(b"<h2>Done. You can close this tab and return to the terminal.</h2>")
+                got["code"] = q["code"][0]
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+        def log_message(self, *_):
+            pass
+
+    httpd = http.server.HTTPServer(("localhost", PORT), Handler)
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+        "client_id": client_id, "redirect_uri": REDIRECT, "response_type": "code",
+        "scope": SCOPE, "access_type": "offline", "prompt": "consent", "state": state})
+    print("\nOpening your browser. Sign in as the account that owns the Drive folder and approve.")
+    print("If nothing opens, paste this into a browser:\n\n" + url + "\n")
+    webbrowser.open(url)
+    httpd.serve_forever()
+
+    if "code" not in got:
+        sys.exit(f"Authorization failed: {got.get('error')}")
+
+    r = requests.post("https://oauth2.googleapis.com/token", data={
+        "code": got["code"], "client_id": client_id, "client_secret": client_secret,
+        "redirect_uri": REDIRECT, "grant_type": "authorization_code"}, timeout=60)
+    if r.status_code >= 400:
+        sys.exit(f"Token exchange failed: {r.status_code} {r.text}")
+    tok = r.json()
+    refresh = tok.get("refresh_token")
+    if not refresh:
+        sys.exit("Google did not return a refresh token. Revoke the app at "
+                 "myaccount.google.com/permissions and run this again.")
+
+    # quick sanity check: can we see Drive, and which permissions did we get?
+    me = requests.get("https://www.googleapis.com/drive/v3/about",
+                      headers={"Authorization": f"Bearer {tok['access_token']}"},
+                      params={"fields": "user(emailAddress)"}, timeout=30).json()
+    print(f"\nAuthorized as: {me.get('user', {}).get('emailAddress', '?')}")
+    print("Permissions on this token:")
+    for s in (tok.get("scope") or SCOPE).split():
+        print("  -", s)
+    print()
+    print("Add these as GitHub repository secrets (Settings > Secrets and variables > Actions):\n")
+    print(f"  GDRIVE_CLIENT_ID      = {client_id}")
+    print(f"  GDRIVE_CLIENT_SECRET  = {client_secret}")
+    print(f"  GDRIVE_REFRESH_TOKEN  = {refresh}")
+    print("\nGDRIVE_FOLDER_ID is the last part of the folder's URL in Drive:")
+    print("  https://drive.google.com/drive/folders/<GDRIVE_FOLDER_ID>\n")
+    print("Keep the refresh token private: it grants full access to this account's Drive.")
+
+
+
+DRIVE_SCOPES = ("https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/drive.file",
+                "https://www.googleapis.com/auth/drive.readonly")
+
+
+def cmd_check_token():
+    client_id = ask("GDRIVE_CLIENT_ID", "OAuth client id: ")
+    client_secret = ask("GDRIVE_CLIENT_SECRET", "OAuth client secret: ")
+    refresh = ask("GDRIVE_REFRESH_TOKEN", "Refresh token to test: ")
+    folder_id = ask("GDRIVE_FOLDER_ID", "Drive folder id (from the folder URL): ")
+
+    print("\n1) Refreshing the token ...")
+    r = requests.post("https://oauth2.googleapis.com/token", data={
+        "grant_type": "refresh_token", "client_id": client_id,
+        "client_secret": client_secret, "refresh_token": refresh}, timeout=60)
+    if r.status_code >= 400:
+        sys.exit(f"   FAILED: {r.status_code} {r.text}\n"
+                 "   -> client id/secret and refresh token do not belong together, "
+                 "or the token was revoked.")
+    access = r.json()["access_token"]
+    print("   OK")
+
+    print("\n2) Permissions on this token:")
+    info = requests.get("https://oauth2.googleapis.com/tokeninfo",
+                        params={"access_token": access}, timeout=30).json()
+    scopes = info.get("scope", "").split()
+    for s in scopes:
+        print("   -", s)
+    print("   account:", info.get("email", "(not included)"))
+    has_write = "https://www.googleapis.com/auth/drive" in scopes
+    has_any = any(s in DRIVE_SCOPES for s in scopes)
+    if not has_any:
+        print("\n   -> No Drive permission at all. This is a Gmail-only token.")
+    elif not has_write:
+        print("\n   -> Drive permission is present but not the full one; the job needs "
+              "'auth/drive' to replace the baseline files.")
+
+    print("\n3) Listing the folder ...")
+    r = requests.get("https://www.googleapis.com/drive/v3/files",
+                     headers={"Authorization": f"Bearer {access}"},
+                     params={"q": f"'{folder_id}' in parents and trashed = false",
+                             "fields": "files(name,size,modifiedTime)", "pageSize": 100,
+                             "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"},
+                     timeout=60)
+    if r.status_code >= 400:
+        print(f"   FAILED: {r.status_code} {r.json().get('error', {}).get('message', r.text[:200])}")
+        print("\nVERDICT: this token cannot be used for Drive. Run `python main.py get-token` with the "
+              "same client id and secret to get one that can.")
+        sys.exit(1)
+    files = r.json().get("files", [])
+    for f in sorted(files, key=lambda f: f["name"]):
+        mb = int(f.get("size") or 0) / 1024 / 1024
+        print(f"   {f['name']:<45} {mb:6.1f} MB  {f.get('modifiedTime', '')[:16]}")
+    names = {f["name"] for f in files}
+    missing = [n for n in ("Geotab_Devices.csv", "Zenduit_Devices.csv") if n not in names]
+    if missing:
+        print(f"\n   WARNING: not found in this folder: {', '.join(missing)}")
+
+    if has_write:
+        print("\nVERDICT: this token works for Drive. Use it as GDRIVE_REFRESH_TOKEN.")
+    else:
+        print("\nVERDICT: can read but not write. Run `python main.py get-token` for a full Drive token.")
+
+
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd in ("get-token", "get_token"):
+        cmd_get_token()
+    elif cmd in ("check-token", "check_token"):
+        cmd_check_token()
+    else:
+        main()
