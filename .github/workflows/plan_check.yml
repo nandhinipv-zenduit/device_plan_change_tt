@@ -80,9 +80,11 @@ jobs:
           ZOHO_CLIENT_SECRET_ANALYTICS: ${{ secrets.ZOHO_CLIENT_SECRET_ANALYTICS }}
           ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS: ${{ secrets.ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS }}
           # ---- Zoho CRM: cancellation requests for terminated devices ----
-          # Same client as Analytics; a refresh token with CRM read scopes made by
-          #   python main.py zoho-token <grant code>
-          # Leave the secret empty to skip the check (the email then says so).
+          # CRM has its own OAuth client (separate from Analytics). All three are
+          # needed; the refresh token is made by  python main.py zoho-token <grant code>
+          # Leave them empty to skip the check (the email then says so).
+          ZOHO_CLIENT_ID_CRM: ${{ secrets.ZOHO_CLIENT_ID_CRM }}
+          ZOHO_CLIENT_SECRET_CRM: ${{ secrets.ZOHO_CLIENT_SECRET_CRM }}
           ZOHO_CLIENT_REFRESH_TOKEN_CRM: ${{ secrets.ZOHO_CLIENT_REFRESH_TOKEN_CRM }}
           CRM_LOOKBACK_DAYS: "180"   # how far back to look for cancellation requests
           # ---- Email: sent through the Gmail API with the same Google token ----
@@ -91,6 +93,7 @@ jobs:
           MAIL_VIA: gmail_api
           EMAIL_FROM: ${{ secrets.SMTP_USERNAME }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          FAILURE_EMAIL_TO: ${{ secrets.SMTP_USERNAME }}   # failure alerts to you, not to the billing mailbox (which raises tickets)
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "587"
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
@@ -110,7 +113,6 @@ jobs:
           name: plan-check-${{ github.run_id }}
           path: |
             work/plan_changes_*.csv
-            work/report_*.html
             work/compare_plans.log
           if-no-files-found: ignore
           retention-days: 90
