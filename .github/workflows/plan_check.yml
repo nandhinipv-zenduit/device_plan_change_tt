@@ -70,13 +70,16 @@ jobs:
           ZOHO_CLIENT_ID_ANALYTICS: ${{ secrets.ZOHO_CLIENT_ID_ANALYTICS }}
           ZOHO_CLIENT_SECRET_ANALYTICS: ${{ secrets.ZOHO_CLIENT_SECRET_ANALYTICS }}
           ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS: ${{ secrets.ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS }}
-          # ---- Email ----
+          # ---- Email: sent through the Gmail API with the same Google token ----
+          # (Gmail refuses SMTP logins from GitHub's runners, so SMTP is only a
+          #  fallback here; SMTP_USERNAME/SMTP_PASSWORD may be left unset.)
+          MAIL_VIA: gmail_api
+          EMAIL_FROM: ${{ secrets.SMTP_USERNAME }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "587"
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_FROM: ${{ secrets.SMTP_USERNAME }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
           # ---- Housekeeping ----
           KEEP_BACKUPS: "0"         # no backup copies: Drive keeps the baseline's own version history
           KEEP_REPORTS: "200"
