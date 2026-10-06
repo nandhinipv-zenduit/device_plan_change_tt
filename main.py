@@ -289,6 +289,8 @@ SMTP_PASS = env("SMTP_PASSWORD")
 MAIL_FROM = env("EMAIL_FROM", SMTP_USER)
 # A list, always. ", ".join("a@b.com") would spell the address out letter by letter.
 MAIL_TO = [a.strip() for a in env("EMAIL_TO", "billing@gofleet.com").split(",") if a.strip()]
+# Failure alerts go here instead of to billing (whose mailbox raises a ticket for every mail).
+FAILURE_TO = [a.strip() for a in env("FAILURE_EMAIL_TO", SMTP_USER).split(",") if a.strip()]
 # How to send: gmail_api (HTTPS, uses the Google refresh token's gmail.send
 # permission) or smtp (app password). Defaults to the API whenever a Google
 # token is configured, because Gmail refuses SMTP logins from GitHub runners.
@@ -820,11 +822,11 @@ def google_client():
     return _google
 
 
-def build_message(subject, html, text, attachments=()):
+def build_message(subject, html, text, attachments=(), to=None):
     msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = MAIL_FROM
-    msg["To"] = ", ".join(MAIL_TO)
+    msg["To"] = ", ".join(to or MAIL_TO)
     body = MIMEMultipart("alternative")
     body.attach(MIMEText(text, "plain"))
     body.attach(MIMEText(html, "html"))
@@ -855,35 +857,36 @@ def send_via_gmail_api(msg):
         raise RuntimeError(f"Gmail API send failed: {r.status_code} {r.text[:400]}{hint}")
 
 
-def send_via_smtp(msg):
+def send_via_smtp(msg, to=None):
     if not (SMTP_USER and SMTP_PASS):
         die("SMTP_USERNAME / SMTP_PASSWORD not set (or set MAIL_VIA=gmail_api with a Google token)")
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as s:
         s.starttls()
         s.login(SMTP_USER, SMTP_PASS)
-        s.sendmail(MAIL_FROM, MAIL_TO, msg.as_string())
+        s.sendmail(MAIL_FROM, to or MAIL_TO, msg.as_string())
 
 
-def send_mail(subject, html, text, attachments=()):
-    """attachments: iterable of (filename, text or bytes).
+def send_mail(subject, html, text, attachments=(), to=None):
+    """attachments: iterable of (filename, text or bytes). to: recipients (default MAIL_TO).
 
     MAIL_VIA=gmail_api (default whenever a Google refresh token is configured)
     sends through the Gmail API; MAIL_VIA=smtp uses SMTP with the app password.
     If the API send fails and SMTP credentials exist, SMTP is tried as a fallback."""
-    if not (MAIL_FROM and MAIL_TO):
+    to = to or MAIL_TO
+    if not (MAIL_FROM and to):
         die("EMAIL_FROM / EMAIL_TO not set")
-    msg = build_message(subject, html, text, attachments)
+    msg = build_message(subject, html, text, attachments, to)
     if MAIL_VIA == "gmail_api":
         try:
             send_via_gmail_api(msg)
-            say(f"Emailed {', '.join(MAIL_TO)} (Gmail API)")
+            say(f"Emailed {', '.join(to)} (Gmail API)")
             return
         except Exception as exc:
             if not SMTP_PASS:
                 raise
             say(f"Gmail API send failed ({exc}); falling back to SMTP")
-    send_via_smtp(msg)
-    say(f"Emailed {', '.join(MAIL_TO)} (SMTP)")
+    send_via_smtp(msg, to)
+    say(f"Emailed {', '.join(to)} (SMTP)")
 
 
 KIND_LABEL = {"added": "Added", "terminated": "Terminated", "changed": "Plan Change"}
@@ -924,6 +927,7 @@ def counts(changes):
                               and c.get("crm_checked") and not c.get("cancellations"))}
 
 
+ROW_CAP = int(env("EMAIL_ROW_CAP", "300"))      # rows per table in the email body; the rest is in report.xlsx
 CARD_COLORS = {"added": "#1a7f4b", "terminated": "#b3261e", "changed": "#1a5fb4"}
 CARD_LABELS = {"added": "Devices Added", "terminated": "Terminated", "changed": "Plan Changes"}
 
@@ -948,9 +952,55 @@ def cards_row(changes):
             + "</tr></table>")
 
 
+def change_table_html(source, changes):
+    """ONE table per source: every changed device, with a Change column."""
+    th = (f"padding:7px 9px;background:#{BRAND};color:#fff;font-size:12px;text-align:left;"
+          "white-space:nowrap;border-right:1px solid rgba(255,255,255,.15)")
+    td = "padding:6px 9px;border-bottom:1px solid #e3e6eb;font-size:12px;vertical-align:top"
+    extra = [lab for lab, _, _ in source.get("columns", [])]
+    crm_checked = any(c.get("crm_checked") for c in changes)
+    headers = ["Change", "Customer", "Serial", "Plan (old &rarr; new)"] + extra + ["Cancellation Request"]
+    head = "".join(f"<th style='{th}'>{h}</th>" for h in headers)
+    rows = []
+    for i, c in enumerate(changes[:ROW_CAP]):
+        bg = "#ffffff" if i % 2 == 0 else "#f8f9fb"
+        color = CARD_COLORS[c["kind"]]
+        kind = f"<span style='color:{color};font-weight:600;white-space:nowrap'>{KIND_LABEL[c['kind']]}</span>"
+        if c["kind"] == "added":
+            plan = f"<span style='color:#8a94a3'>{esc(c['old_plan'])}</span> &rarr; <b>{esc(c['new_plan'])}</b>"
+        elif c["kind"] == "terminated":
+            plan = f"{esc(c['old_plan'])} &rarr; <span style='color:#b3261e;font-weight:600'>{esc(c['new_plan'])}</span>"
+        else:
+            plan = f"{esc(c['old_plan'])} &rarr; <b>{esc(c['new_plan'])}</b>"
+        if c["kind"] != "terminated":
+            canc = "<span style='color:#8a94a3'>-</span>"
+        elif not c.get("crm_checked"):
+            canc = "<span style='color:#8a94a3'>not checked</span>"
+        elif not c.get("cancellations"):
+            canc = "<span style='color:#b3261e;font-weight:600'>No request found</span>"
+        else:
+            canc = "<br>".join(
+                a(q["ref"] or "request", q["url"])
+                + (f" &middot; {a(q['ticket'], q['ticket_url'])}" if q["ticket"] else "")
+                + f" &middot; {esc(q['status'])}"
+                + (f" / {esc(q['finance_status'])}" if q["finance_status"] else "")
+                + (f" <span style='color:#8a94a3'>(req {esc(q['requested'])})</span>" if q["requested"] else "")
+                for q in c["cancellations"])
+        cells = [kind, a(c["customer"], crm_link(c)),
+                 f"<span style='font-family:Consolas,Menlo,monospace;white-space:nowrap'>"
+                 f"{a(c['serial'] if c.get('has_serial', True) else '-', device_link(c))}</span>",
+                 plan] + [esc(v) or "-" for v in c["fields"].values()] + [canc]
+        rows.append(f"<tr style='background:{bg}'>" + "".join(f"<td style='{td}'>{x}</td>" for x in cells) + "</tr>")
+    more = (f"<p style='font-size:12px;color:#5b6472;margin:6px 0 0'>&hellip; and {len(changes) - ROW_CAP} more "
+            f"in the attached report.xlsx.</p>" if len(changes) > ROW_CAP else "")
+    return (f"<div style='overflow-x:auto;margin-top:10px'><table cellpadding='0' cellspacing='0' "
+            f"style='border-collapse:collapse;width:100%;min-width:900px'>"
+            f"<tr>{head}</tr>{''.join(rows)}</table></div>{more}")
+
+
 def source_html(result):
     label = result["label"]
-    head = (f"<h2 style='font-size:16px;margin:26px 0 2px;padding-top:16px;border-top:2px solid #e3e6eb;"
+    head = (f"<h2 style='font-size:17px;margin:26px 0 2px;padding-top:16px;border-top:2px solid #e3e6eb;"
             f"color:#1f2a37'>{esc(label)}</h2>")
     if result["first_run"]:
         return head + (f"<p style='font-size:13px;color:#5b6472'>No baseline existed for {esc(label)}; created "
@@ -960,7 +1010,8 @@ def source_html(result):
         return head + "<p style='font-size:13px;color:#5b6472'>No device plan changes.</p>"
     n = counts(result["changes"])
     return head + (f"<div style='font-size:12px;color:#5b6472'>{n['customers']} customer(s) affected</div>"
-                   + cards_row(result["changes"]))
+                   + cards_row(result["changes"])
+                   + change_table_html(result["source"], result["changes"]))
 
 
 def digest_html(results, when):
@@ -968,16 +1019,20 @@ def digest_html(results, when):
     labels = " &amp; ".join(esc(r["label"]) for r in results)
     checked = any(c.get("crm_checked") for c in all_changes)
     intro = (f"Device activations, terminations and plan changes since the previous run, for {labels}. "
-             f"Open the attached <b>report.html</b> for the clickable view: each card lists its device "
-             f"serials with <i>Copy</i> and <i>Download CSV</i>. The full breakdown is also in "
-             f"<b>report.xlsx</b> (one sheet per source).")
-    crm_line = ("Terminated devices were checked against Zoho CRM cancellation requests; the red note "
-                "under a Terminated card counts devices with no matching request."
+             f"Customer names open the Zoho CRM account; serial numbers open the device page where a link is "
+             f"configured. The full breakdown is attached as <b>report.xlsx</b> (one sheet per source).")
+    crm_line = ("Terminated devices were checked against Zoho CRM cancellation requests: the last column shows "
+                "the matching request (reference &middot; ticket &middot; status), or <b style='color:#b3261e'>"
+                "No request found</b>."
                 if checked else
                 "Cancellation requests were <b>not</b> checked this run (CRM token not configured or lookup failed).")
+    overall = ""
+    if len(results) > 1:
+        overall = ("<h2 style='font-size:16px;margin:22px 0 2px;color:#1f2a37'>All sources</h2>"
+                   + cards_row(all_changes))
     return (f"<html><body style='margin:0;padding:0;background:#eef1f5'>"
             f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;background:#eef1f5'><tr><td align='center' style='padding:18px 8px'>"
-            f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;max-width:760px;background:#fff;border-radius:10px;overflow:hidden;font-family:Segoe UI,Helvetica,Arial,sans-serif;color:#1f2a37'>"
+            f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;max-width:1200px;background:#fff;border-radius:10px;overflow:hidden;font-family:Segoe UI,Helvetica,Arial,sans-serif;color:#1f2a37'>"
             f"<tr><td style='background:#{BRAND};padding:18px 24px'>"
             f"<div style='font-size:11px;letter-spacing:.12em;color:#c9d4e3;text-transform:uppercase'>Device Billing Update</div>"
             f"<div style='font-size:20px;font-weight:700;color:#fff;margin-top:4px'>{labels} &middot; Daily</div>"
@@ -985,7 +1040,7 @@ def digest_html(results, when):
             f"<tr><td style='padding:18px 24px 26px'>"
             f"<p style='font-size:13px;line-height:1.5;margin:0'>{intro}</p>"
             f"<p style='font-size:12px;line-height:1.5;margin:8px 0 0;color:#5b6472'>{crm_line}</p>"
-            f"{('<h2 style=font-size:16px;margin:22px_0_2px;color:#1f2a37>All sources</h2>'.replace('_', ' ') + cards_row(all_changes)) if len(results) > 1 else ''}"
+            f"{overall}"
             f"{''.join(source_html(r) for r in results)}"
             f"</td></tr></table></td></tr></table></body></html>")
 
@@ -996,156 +1051,39 @@ def digest_text(results, when):
         lines.append(f"== {r['label']} ==")
         if r["first_run"]:
             lines.append(f"Baseline created with {r['count']} devices; nothing to compare yet.")
+            lines.append("")
             continue
         n = counts(r["changes"])
         lines.append(f"Devices added: {n['added']}   Terminated: {n['terminated']} "
                      f"({n['no_request']} without a cancellation request)   Plan changes: {n['changed']}")
-        for kind in ("added", "terminated", "changed"):
-            rows = [c for c in r["changes"] if c["kind"] == kind]
-            if rows:
-                lines.append(f"-- {CARD_LABELS[kind]} ({len(rows)})")
-                for c in rows:
-                    extra = f"  [{cancel_text(c)}]" if kind == "terminated" else ""
-                    lines.append(f"  {c['serial']}  ({c['customer'] or '-'})  {c['old_plan']} -> {c['new_plan']}{extra}")
+        for c in r["changes"]:
+            extra = f"  [{cancel_text(c)}]" if c["kind"] == "terminated" else ""
+            lines.append(f"  {KIND_LABEL[c['kind']]:<11} {c['serial']}  ({c['customer'] or '-'})  "
+                         f"{c['old_plan']} -> {c['new_plan']}{extra}")
         lines.append("")
-    lines.append("Clickable view: report.html (attached). Full breakdown: report.xlsx (attached).")
+    lines.append("Full breakdown attached as report.xlsx.")
     return "\n".join(lines)
-
-
-# ------------------------------------------------------------ report.html
-
-def build_report_html(results, when):
-    """Self-contained interactive page: the same cards, clickable. Opens in any
-    browser from the attachment; no network needed."""
-    data = []
-    for r in results:
-        data.append({
-            "key": r["key"], "label": r["label"], "first_run": r["first_run"], "count": r["count"],
-            "columns": [lab for lab, _, _ in r["source"].get("columns", [])],
-            "changes": [{
-                "kind": c["kind"], "serial": c["serial"] if c.get("has_serial", True) else "",
-                "id": c["serial"], "customer": c["customer"], "crm_url": crm_link(c),
-                "device_url": device_link(c), "old_plan": c["old_plan"], "new_plan": c["new_plan"],
-                "fields": list(c["fields"].values()),
-                "crm_checked": bool(c.get("crm_checked")),
-                "cancellations": [{"ref": q["ref"], "ticket": q["ticket"], "status": q["status"],
-                                   "finance_status": q["finance_status"], "requested": q["requested"],
-                                   "url": q["url"], "ticket_url": q["ticket_url"]}
-                                  for q in (c.get("cancellations") or [])],
-            } for c in r["changes"]],
-        })
-    payload = json.dumps({"when": when, "brand": "#" + BRAND, "sources": data}).replace("</", "<\\/")
-    return REPORT_TEMPLATE.replace("__DATA__", payload)
-
-
-REPORT_TEMPLATE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Device billing changes</title>
-<style>
-:root{--brand:#1F3A5F;--ink:#1f2a37;--mute:#5b6472;--line:#e3e6eb;--bg:#eef1f5;--add:#1a7f4b;--term:#b3261e;--chg:#1a5fb4}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);font:14px/1.45 "Segoe UI",Helvetica,Arial,sans-serif;color:var(--ink)}
-.wrap{max-width:1180px;margin:18px auto;background:#fff;border-radius:10px;overflow:hidden}
-.head{background:var(--brand);color:#fff;padding:18px 24px}.head small{display:block;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#c9d4e3}
-.head b{font-size:20px}.head span{display:block;font-size:12px;color:#c9d4e3;margin-top:4px}
-.body{padding:18px 24px 28px}h2{font-size:16px;margin:24px 0 6px;padding-top:14px;border-top:2px solid var(--line)}h2.first{border:0;padding:0;margin-top:6px}
-.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:10px 0}
-.card{background:#f4f6fa;border-radius:8px;border-bottom:3px solid #ccc;padding:16px 10px;text-align:center;cursor:pointer;transition:transform .08s,box-shadow .08s;border-top:1px solid transparent}
-.card:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.08)}.card.on{outline:2px solid var(--brand);outline-offset:2px}
-.card .n{font-size:30px;font-weight:700;line-height:1}.card .c{font-size:11px;color:var(--mute);text-transform:uppercase;letter-spacing:.04em;margin-top:6px}
-.card .w{font-size:11px;color:var(--term);margin-top:4px}
-.card.added{border-bottom-color:var(--add)}.card.added .n{color:var(--add)}
-.card.terminated{border-bottom-color:var(--term)}.card.terminated .n{color:var(--term)}
-.card.changed{border-bottom-color:var(--chg)}.card.changed .n{color:var(--chg)}
-.card.zero{opacity:.45;cursor:default}
-#panel{margin-top:18px;border:1px solid var(--line);border-radius:8px;overflow:hidden;display:none}
-#panel .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;background:#f8f9fb;border-bottom:1px solid var(--line)}
-#panel .bar h3{margin:0;font-size:15px;flex:1 1 auto}#panel .bar input{padding:6px 9px;border:1px solid #c9d0da;border-radius:6px;min-width:200px}
-button{border:0;border-radius:6px;padding:7px 12px;font-weight:600;cursor:pointer;background:var(--brand);color:#fff}button.alt{background:#e7ebf1;color:var(--ink)}button:active{transform:translateY(1px)}
-.tbl{overflow:auto;max-height:70vh}table{border-collapse:collapse;width:100%;min-width:780px}th{position:sticky;top:0;background:var(--brand);color:#fff;font-size:12px;text-align:left;padding:7px 9px;white-space:nowrap}
-td{padding:6px 9px;border-bottom:1px solid var(--line);font-size:12px;vertical-align:top}tr:nth-child(even) td{background:#f8f9fb}
-.mono{font-family:Consolas,Menlo,monospace}a{color:#1a5fb4;text-decoration:none}a:hover{text-decoration:underline}
-.bad{color:var(--term);font-weight:600}.ok{color:var(--add)}.mute{color:var(--mute)}
-.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#1f2a37;color:#fff;padding:9px 14px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s}.toast.show{opacity:1}
-.foot{font-size:12px;color:var(--mute);margin-top:18px}
-</style></head><body><div class="wrap">
-<div class="head"><small>Device Billing Update</small><b id="title"></b><span id="when"></span></div>
-<div class="body">
-<p class="mute" style="margin:0 0 4px">Click a card to list its devices. <b>Copy serials</b> puts one serial per line on the clipboard; <b>Download CSV</b> saves the visible rows with every column.</p>
-<div id="sections"></div>
-<div id="panel"><div class="bar"><h3 id="ptitle"></h3><input id="q" placeholder="Filter (serial, customer, plan)…"><button id="copy">Copy serials</button><button id="copyall" class="alt">Copy all columns</button><button id="dl" class="alt">Download CSV</button></div><div class="tbl"><table><thead id="th"></thead><tbody id="tb"></tbody></table></div></div>
-<div class="foot">Customer names open the Zoho CRM account. Serial numbers open the device page where a link is configured. “Cancellation request” shows the matching Zoho CRM cancellation (ref · ticket · status); <span class="bad">No request found</span> means a device was terminated with no request on file in the look-back window.</div>
-</div></div><div class="toast" id="toast"></div>
-<script id="data" type="application/json">__DATA__</script>
-<script>
-const D=JSON.parse(document.getElementById('data').textContent);
-const KL={added:'Devices Added',terminated:'Terminated',changed:'Plan Changes'};
-const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-document.getElementById('title').textContent=D.sources.map(s=>s.label).join(' & ')+' · Daily';
-document.getElementById('when').textContent=D.when;document.documentElement.style.setProperty('--brand',D.brand);
-const all={key:'all',label:'All sources',changes:D.sources.flatMap(s=>s.changes.map(c=>({...c,_src:s.label,_cols:s.columns}))),columns:[],first_run:false};
-D.sources.forEach(s=>s.changes.forEach(c=>{c._src=s.label;c._cols=s.columns}));
-const groups=(D.sources.length>1?[all]:[]).concat(D.sources);
-function cnt(ch){const n={added:0,terminated:0,changed:0,nr:0};ch.forEach(c=>{n[c.kind]++;if(c.kind==='terminated'&&c.crm_checked&&!c.cancellations.length)n.nr++});return n}
-const sec=document.getElementById('sections');
-groups.forEach((g,gi)=>{const h=document.createElement('h2');if(gi===0)h.className='first';h.textContent=g.label;sec.appendChild(h);
- if(g.first_run){const p=document.createElement('p');p.className='mute';p.textContent='Baseline created with '+g.count.toLocaleString()+' devices; nothing to compare yet.';sec.appendChild(p);return}
- const n=cnt(g.changes);const row=document.createElement('div');row.className='cards';
- ['added','terminated','changed'].forEach(k=>{const d=document.createElement('div');d.className='card '+k+(n[k]?'':' zero');
-  d.innerHTML='<div class="n">'+n[k]+'</div><div class="c">'+KL[k]+'</div>'+(k==='terminated'&&n.nr?'<div class="w">'+n.nr+' without a cancellation request</div>':'');
-  if(n[k])d.onclick=()=>show(g,k,d);row.appendChild(d)});sec.appendChild(row)});
-let cur=null;
-function cancelCell(c){if(!c.crm_checked)return'<span class="mute">not checked</span>';if(!c.cancellations.length)return'<span class="bad">No request found</span>';
- return c.cancellations.map(q=>'<a href="'+esc(q.url)+'" target="_blank">'+esc(q.ref||'request')+'</a>'+(q.ticket?' · '+(q.ticket_url?'<a href="'+esc(q.ticket_url)+'" target="_blank">'+esc(q.ticket)+'</a>':esc(q.ticket)):'')+' · '+esc(q.status)+(q.finance_status?' / '+esc(q.finance_status):'')+(q.requested?' <span class="mute">(req '+esc(q.requested)+')</span>':'')).join('<br>')}
-function rowsFor(){const q=document.getElementById('q').value.trim().toLowerCase();return cur.rows.filter(c=>!q||JSON.stringify([c.serial,c.id,c.customer,c.old_plan,c.new_plan,c.fields,c._src]).toLowerCase().includes(q))}
-function show(g,k,el){document.querySelectorAll('.card.on').forEach(x=>x.classList.remove('on'));el.classList.add('on');
- const multi=g.key==='all';const cols=multi?[]:g.columns;
- cur={g,k,rows:g.changes.filter(c=>c.kind===k),cols,multi};document.getElementById('ptitle').textContent=g.label+' — '+KL[k]+' ('+cur.rows.length+')';
- document.getElementById('q').value='';document.getElementById('panel').style.display='block';render();document.getElementById('panel').scrollIntoView({behavior:'smooth',block:'start'})}
-function render(){const rows=rowsFor();const k=cur.k;const head=(cur.multi?['Source']:[]).concat(['Serial','Customer',k==='changed'?'Plan (old → new)':k==='added'?'Device Plan':'Device Plan'],cur.cols,k==='terminated'?['Cancellation request']:[]);
- document.getElementById('th').innerHTML='<tr>'+head.map(h=>'<th>'+esc(h)+'</th>').join('')+'</tr>';
- document.getElementById('tb').innerHTML=rows.map(c=>{const plan=k==='changed'?esc(c.old_plan)+' → <b>'+esc(c.new_plan)+'</b>':k==='added'?'<b>'+esc(c.new_plan)+'</b>':'<span class="bad">'+esc(c.new_plan)+'</span> <span class="mute">(was '+esc(c.old_plan)+')</span>';
-  const ser=c.serial?(c.device_url?'<a href="'+esc(c.device_url)+'" target="_blank">'+esc(c.serial)+'</a>':esc(c.serial)):'<span class="mute">-</span>';
-  const cust=c.crm_url?'<a href="'+esc(c.crm_url)+'" target="_blank">'+esc(c.customer||'-')+'</a>':esc(c.customer||'-');
-  const f=cur.multi?[]:c.fields;return'<tr>'+(cur.multi?'<td>'+esc(c._src)+'</td>':'')+'<td class="mono">'+ser+'</td><td>'+cust+'</td><td>'+plan+'</td>'+f.map(v=>'<td>'+(esc(v)||'-')+'</td>').join('')+(k==='terminated'?'<td>'+cancelCell(c)+'</td>':'')+'</tr>'}).join('');
- document.getElementById('ptitle').textContent=cur.g.label+' — '+KL[k]+' ('+rows.length+(rows.length!==cur.rows.length?' of '+cur.rows.length:'')+')'}
-document.getElementById('q').oninput=render;
-function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1600)}
-async function copyText(t){try{await navigator.clipboard.writeText(t)}catch(e){const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}}
-document.getElementById('copy').onclick=async()=>{const rows=rowsFor();const ser=rows.map(c=>c.serial||c.id).filter(Boolean);await copyText(ser.join('\n'));toast(ser.length+' serial(s) copied')};
-function csvRows(){const rows=rowsFor();const k=cur.k;const cols=cur.multi?[]:cur.cols;const head=['Source','Change','Serial','Device Id','Customer','CRM Link','Device Link','Old Plan','New Plan'].concat(cols,['Cancellation Request','Cancellation Link','Ticket Link']);
- const body=rows.map(c=>{const q=c.cancellations[0];const ct=!c.crm_checked?'not checked':c.cancellations.length?c.cancellations.map(x=>(x.ref||x.url)+' '+x.ticket+' - '+x.status+(x.finance_status?' / '+x.finance_status:'')+(x.requested?' (req '+x.requested+')':'')).join('; '):'NO REQUEST FOUND';
-  return[c._src,KL[c.kind],c.serial,c.id,c.customer,c.crm_url,c.device_url,c.old_plan,c.new_plan].concat(cur.multi?[]:c.fields,[ct,q?q.url:'',q?q.ticket_url:''])});return[head].concat(body)}
-const q=v=>{v=String(v??'');return/[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v};
-document.getElementById('copyall').onclick=async()=>{const r=csvRows();await copyText(r.map(x=>x.join('\t')).join('\n'));toast((r.length-1)+' row(s) copied (tab-separated, paste into Excel)')};
-document.getElementById('dl').onclick=()=>{const r=csvRows();const blob=new Blob(['﻿'+r.map(x=>x.map(q).join(',')).join('\n')],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=(cur.g.key+'_'+cur.k+'_'+D.when.replace(/[^0-9]/g,'').slice(0,12)+'.csv');a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500)};
-</script></body></html>"""
 
 
 def email_results(results):
     """One email, a section per source in SOURCES order (Geotab, then Zenduit)."""
     when = time.strftime("%b %d, %Y %H:%M UTC", time.gmtime())
     created = [r["label"] for r in results if r["first_run"]]
-    subject = "Device billing changes - " + " & ".join(r["label"] for r in results) + " (Daily)"
+    subject = (f"Device billing changes - {' & '.join(r['label'] for r in results)} - "
+               f"{time.strftime('%d %b %Y', time.gmtime())}")
     if created:
         subject += f" - baseline created: {', '.join(created)}"
-    attachments = [("report.html", build_report_html(results, when))]
     xlsx = build_xlsx(results)
     if xlsx:
-        attachments.append(("report.xlsx", xlsx))
+        attachments = [("report.xlsx", xlsx)]
     else:
-        attachments += [(f"plan_changes_{r['key']}.csv", build_csv(r["source"], r["changes"]))
-                        for r in results if r["changes"]]
+        attachments = [(f"plan_changes_{r['key']}.csv", build_csv(r["source"], r["changes"]))
+                       for r in results if r["changes"]]
     for r in results:
         if not r["first_run"]:
             n = counts(r["changes"])
             say(f"Email summary [{r['label']}]: {n['added']} added, {n['terminated']} terminated "
                 f"({n['no_request']} without request), {n['changed']} plan changes")
-    # keep a copy of the interactive report next to the CSVs (becomes a run artifact)
-    try:
-        with open(os.path.join(DISCREPANCY_DIR, f"report_{time.strftime('%Y%m%d_%H%M')}.html"),
-                  "w", encoding="utf-8") as fh:
-            fh.write(attachments[0][1])
-    except OSError:
-        pass
     send_mail(subject, digest_html(results, when), digest_text(results, when), attachments)
 
 
@@ -1158,7 +1096,7 @@ def email_failure(err):
                 f"<p><b>The device plan-change check failed.</b></p>"
                 f"<pre style='background:#f6f6f6;padding:10px;font-size:12px'>{err}</pre>"
                 f"<p style='color:#777;font-size:11px'>Log: {LOG_PATH}</p></body></html>")
-        send_mail("Device plan check FAILED", html, text)
+        send_mail("Device plan check FAILED", html, text, to=FAILURE_TO)
     except Exception:
         say("Could not send the failure email either.")
 
