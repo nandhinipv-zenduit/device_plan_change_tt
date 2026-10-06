@@ -85,7 +85,10 @@ WHAT A RUN DOES, IN ORDER
     KEEP_BACKUPS (optional; 0 disables baseline_backups/), KEEP_REPORTS
 """
 import base64
+import collections
 import csv
+import datetime
+import html as html_mod
 import gzip
 import http.server
 import io
@@ -150,6 +153,18 @@ KEEP_REPORTS = int(env("KEEP_REPORTS", "200"))      # per source
 
 WORKSPACE_ID = env("ZOHO_ANALYTICS_WORKSPACE_ID", "953790000013364003")
 
+# Zoho CRM: both device tables carry the CRM Account record id, so the customer
+# name in the email links straight to the account page without any CRM lookup.
+CRM_ORG = env("CRM_ORG_ID", "3130230")                 # crm.zoho.com/crm/org<this>/...
+CRM_ACCOUNT_URL = env("CRM_ACCOUNT_URL", f"https://crm.zoho.com/crm/org{CRM_ORG}/tab/Accounts/{{crm_id}}")
+
+# Device page links. Templates with placeholders filled from the row:
+#   {serial} {device_id} {company_id} {database} {account} {crm_id}
+# Leave blank for plain-text serials. Set in the workflow (GEOTAB_DEVICE_URL,
+# ZENDUIT_DEVICE_URL) once the portal URL pattern is known.
+GEOTAB_DEVICE_URL = env("GEOTAB_DEVICE_URL", "")
+ZENDUIT_DEVICE_URL = env("ZENDUIT_DEVICE_URL", "")
+
 # One entry per device family. Order here is the order of the email sections
 # and of everything in the log: Geotab first, Zenduit second.
 #
@@ -163,7 +178,13 @@ WORKSPACE_ID = env("ZOHO_ANALYTICS_WORKSPACE_ID", "953790000013364003")
 #                  in the email; the first non-blank value wins per row
 #   plan_cols      exact column names tried first for the plan
 #   customer_cols  exact column names tried first for the customer (optional)
+#   crm_id_cols    column holding the Zoho CRM Account id (optional)
 #   blank_plans    plan values that mean "no plan" (lower-cased)
+#   terminated_plans  plan values that mean the device was terminated
+#   device_url     link template for the serial (see above)
+#   url_fields     placeholder name -> column, for the device_url template
+#   columns        extra columns shown in the email/xlsx: (label, [cols], kind)
+#                  kind: "text" | "date" | "datamb" (megabytes -> GB/MB)
 #
 # If none of the exact names exist, find_col falls back to a fuzzy match
 # (any column containing every word in the fuzzy list), so a renamed column in
@@ -177,7 +198,21 @@ SOURCES = [
         "serial_cols": ["device_serialNumber", "serial", "Serial", "serialNumber", "Serial Number"],
         "plan_cols": ["activeDevicePlan_name"],
         "customer_cols": ["userContact_userCompany_name", "Customer", "Customer Name"],
+        "crm_id_cols": ["userContact_userCompany_partnerCustomerId"],
         "blank_plans": {""},
+        "terminated_plans": set(),
+        "device_url": GEOTAB_DEVICE_URL,
+        "url_fields": {"device_id": "device_id", "database": "OwnerDatabaseName",
+                       "account": "account_accountId"},
+        "columns": [
+            ("Reseller Acct", ["account_accountId"], "text"),
+            ("Device Type", ["device_deviceType_name"], "text"),
+            ("Database", ["OwnerDatabaseName", "latestDeviceDatabase_databaseName"], "text"),
+            ("Billing Plan", ["Active Billing Plan"], "text"),
+            ("Billing Status", ["Billing Status"], "text"),
+            ("Last Communicate", ["latestDeviceDatabase_statusDate"], "date"),
+            ("Date Added", ["startDate", "firstDeviceActivationDate"], "date"),
+        ],
     },
     {
         # The Zenduit table (checked against the real export, Oct 2026):
@@ -188,7 +223,7 @@ SOURCES = [
         #   serial_number  the serial to show; 'Serial' is the fallback
         #   Plan           e.g. 'ZenduONE - Enterprise', 'Terminated',
         #                  'Suspended'. 'None' and '' both mean no plan.
-        #   Company_Name   the customer
+        #   Company_Name   the customer;  AccountId = Zoho CRM account id
         "key": "zenduit",
         "label": "Zenduit",
         "view_id": env("ZENDUIT_VIEW_ID", "953790000054827175"),
@@ -198,7 +233,21 @@ SOURCES = [
         "plan_cols": ["Plan", "plan", "plan_name", "Plan Name"],
         "customer_cols": ["Company_Name", "Customer", "Customer Name", "customer",
                           "customer_name", "Company", "company", "company_name"],
+        "crm_id_cols": ["AccountId"],
         "blank_plans": {"", "none", "null"},
+        "terminated_plans": {"terminated"},
+        "device_url": ZENDUIT_DEVICE_URL,
+        "url_fields": {"device_id": "Device_Id", "company_id": "CompanyId",
+                       "account": "AccountId"},
+        "columns": [
+            ("Reseller", ["Reseller_Name"], "text"),
+            ("Tracker Type", ["Tracker_type"], "text"),
+            ("Device Name", ["Device_Name"], "text"),
+            ("Data Plan", ["Data_Plan"], "datamb"),
+            ("Billing Plan", ["Billing_Plan"], "text"),
+            ("Last Communicate", ["Last_active"], "date"),
+            ("Date Added", ["CreationDate", "Activation_Date"], "date"),
+        ],
     },
 ]
 
@@ -223,7 +272,7 @@ MAIL_TO = [a.strip() for a in env("EMAIL_TO", "billing@gofleet.com").split(",") 
 # token is configured, because Gmail refuses SMTP logins from GitHub runners.
 MAIL_VIA = env("MAIL_VIA", "gmail_api" if GDRIVE_REFRESH_TOKEN else "smtp").lower()
 
-TD = "padding:5px 10px;border:1px solid #ccc"
+REPORT_TZ = env("REPORT_TZ", "America/Toronto")   # timezone for dates shown in the email
 
 
 def say(msg):
@@ -263,7 +312,7 @@ def find_col(fieldnames, candidates, fuzzy, label, required=True):
 
 
 def to_plan_map(text, source, label):
-    """device id -> (plan, customer, serial), using the columns configured for `source`.
+    """device id -> {plan, customer, serial, crm_id, fields{label: value}, url{...}}
 
     The id is the serial number unless the source names an id column (Zenduit:
     Device_Id). The serial is what the email shows; when a row has no serial
@@ -283,28 +332,92 @@ def to_plan_map(text, source, label):
     p_col = find_col(cols, source["plan_cols"], ["plan"], "plan")
     c_col = (find_col(cols, source["customer_cols"], ["customer"], "customer", required=False)
              or find_col(cols, [], ["company"], "customer", required=False))
+    crm_col = next((c for c in source.get("crm_id_cols", []) if c in cols), "")
+    extra = [(lab, next((c for c in cands if c in cols), ""), kind)
+             for lab, cands, kind in source.get("columns", [])]
+    url_fields = {k: v for k, v in source.get("url_fields", {}).items() if v in cols}
     blank_plans = source.get("blank_plans") or {""}
+
+    def val(r, c):
+        # Analytics exports some text HTML-encoded ("Rubber &amp; Plastic"); undo that.
+        return html_mod.unescape(str(r.get(c) or "")).strip() if c else ""
 
     out, dropped, dups = {}, 0, 0
     for r in rows:
-        serial = next((str(r.get(c) or "").strip() for c in s_cols if str(r.get(c) or "").strip()), "")
-        key = str(r.get(id_col) or "").strip() if id_col else serial
+        serial = next((val(r, c) for c in s_cols if val(r, c)), "")
+        key = val(r, id_col) if id_col else serial
         if not key:
             dropped += 1                      # no identity at all: cannot be tracked
             continue
-        plan = str(r.get(p_col) or "").strip()
+        plan = val(r, p_col)
         if plan.lower() in blank_plans:
             plan = ""
         if key in out:
             dups += 1
-        out[key] = (plan, str(r.get(c_col) or "").strip() if c_col else "", serial or key)
+        out[key] = {
+            "plan": plan,
+            "customer": val(r, c_col),
+            "serial": serial or key,
+            "has_serial": bool(serial),
+            "crm_id": val(r, crm_col),
+            "fields": {lab: fmt_field(val(r, c), kind) for lab, c, kind in extra},
+            "url": {**{k: val(r, c) for k, c in url_fields.items()},
+                    "serial": serial or key, "crm_id": val(r, crm_col)},
+        }
     say(f"{label}: {len(out)} devices  (id='{id_col or s_cols[0]}', serial='{'/'.join(s_cols)}', "
-        f"plan='{p_col}', customer='{c_col or '-'}')")
+        f"plan='{p_col}', customer='{c_col or '-'}', crm='{crm_col or '-'}')")
     if dropped:
         say(f"{label}: {dropped} row(s) skipped - no id and no serial")
     if dups:
         say(f"{label}: {dups} duplicate id(s) - last row wins")
     return out
+
+
+def fmt_field(value, kind):
+    if kind == "date":
+        return fmt_date(value)
+    if kind == "datamb":
+        return fmt_data_mb(value)
+    return value
+
+
+def fmt_data_mb(value):
+    """Data plan given in MB: 2448 -> '2.39 GB', 30 -> '30 MB', -1/blank -> ''."""
+    try:
+        mb = float(str(value).strip())
+    except (TypeError, ValueError):
+        return (value or "").strip()
+    if mb <= 0:
+        return ""
+    return f"{mb / 1024:.2f} GB" if mb >= 1000 else f"{mb:g} MB"
+
+
+def fmt_date(value):
+    """'2026-10-05T04:16:38.000Z' / '05 Oct 2026 00:00:00' / '2025-11-21' -> 'Oct 05, 2026 00:16 EDT'.
+    Times are shown in America/Toronto. Anything unparseable is returned as-is."""
+    v = (value or "").strip()
+    if not v or v.startswith("0001-01-01"):
+        return ""
+    dt = None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S", "%d %b %Y %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.datetime.strptime(v, fmt)
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        return v
+    if fmt == "%Y-%m-%d" or (dt.hour, dt.minute, dt.second) == (0, 0, 0):
+        # date-only values (Last_active comes as "05 Oct 2026 00:00:00"): no
+        # timezone shift, or midnight UTC would display as the previous evening
+        return dt.strftime("%b %d, %Y")
+    try:
+        from zoneinfo import ZoneInfo
+        dt = dt.replace(tzinfo=datetime.timezone.utc).astimezone(ZoneInfo(REPORT_TZ))
+        return dt.strftime("%b %d, %Y %H:%M %Z")
+    except Exception:
+        return dt.strftime("%b %d, %Y %H:%M UTC")
 
 
 def strip_bom(text):
@@ -374,65 +487,130 @@ def export_view(token, view_id, label):
 
 # ------------------------------------------------------------------ compare
 
-def compare(old, new, include_never_activated=False, label=""):
-    """Devices whose plan differs between the two datasets.
+def compare(old, new, include_never_activated=False, label="", terminated_plans=()):
+    """Devices whose plan differs between the two datasets, as dicts:
+
+        {kind, serial, customer, crm_id, old_plan, new_plan, fields, url}
+
+    kind is one of
+        "added"       new device carrying a plan, or blank -> plan (activation)
+        "terminated"  plan -> blank / "Terminated" / device gone from the table
+        "changed"     any other plan -> plan (upgrade, downgrade, suspend...)
 
     NEVER-ACTIVATED DEVICES ARE EXCLUDED. A device counts as never activated
     when it has no plan on either side — it appears in one dataset and not the
     other, and carries no plan in the one where it exists. Those are units
     sitting in the table unprovisioned; them showing up or dropping off is not
     a billing change and just buries the real ones.
-
-    What is NOT excluded, deliberately:
-      * a plan going value -> blank. That device WAS activated, and this is a
-        termination — exactly the kind of billing change worth an email.
-      * a plan going blank -> value. That is an activation.
-      * a new serial that arrives already carrying a plan.
     """
-    changes = []
-    skipped = 0
+    term = {t.lower() for t in terminated_plans}
 
-    # Each value is (plan, customer, serial); the dict key is the device identity
-    # (serial for Geotab, Device_Id for Zenduit). The email shows the serial.
-    for key, (new_plan, customer, serial) in new.items():
+    def is_term(plan):
+        return not plan or plan.lower() in term
+
+    def rec(kind, info, old_plan, new_plan):
+        return {"kind": kind, "serial": info["serial"], "has_serial": info.get("has_serial", True),
+                "customer": info["customer"],
+                "crm_id": info["crm_id"], "old_plan": old_plan or "(none)",
+                "new_plan": new_plan or "(none)", "fields": info["fields"], "url": info["url"]}
+
+    changes, skipped = [], 0
+    for key, cur in new.items():
         if key in old:
-            old_plan, old_customer, _ = old[key]
-            if old_plan != new_plan:
-                changes.append((serial, customer or old_customer,
-                                old_plan or "(none)", new_plan or "(none)"))
+            prev = old[key]
+            if prev["plan"] == cur["plan"]:
+                continue
+            info = dict(cur)
+            info["customer"] = cur["customer"] or prev["customer"]
+            info["crm_id"] = cur["crm_id"] or prev["crm_id"]
+            if is_term(prev["plan"]) and not is_term(cur["plan"]):
+                kind = "added"                       # (none)/Terminated -> a plan
+            elif is_term(cur["plan"]):
+                kind = "terminated"                  # a plan -> (none)/Terminated
+            else:
+                kind = "changed"
+            changes.append(rec(kind, info, prev["plan"], cur["plan"]))
         else:
-            # A device in the new data but not the old one. With a plan, that is
-            # an activation. Without one, it has never been activated at all.
-            if not new_plan and not include_never_activated:
+            if is_term(cur["plan"]) and not include_never_activated:
                 skipped += 1
                 continue
-            changes.append((serial, customer, "(not in old file)", new_plan or "(none)"))
+            changes.append(rec("added", cur, "(not in old file)", cur["plan"]))
 
     for key in set(old) - set(new):
-        old_plan, customer, serial = old[key]
-        if not old_plan and not include_never_activated:
+        prev = old[key]
+        if is_term(prev["plan"]) and not include_never_activated:
             skipped += 1
             continue
-        changes.append((serial, customer, old_plan or "(none)", "(not in new data)"))
+        changes.append(rec("terminated", prev, prev["plan"], "(not in new data)"))
 
     if skipped:
         say(f"[{label}] Excluded {skipped} never-activated device(s) (no plan on either side). "
             f"Pass --include-never-activated to see them.")
-    changes.sort(key=lambda c: (c[1], c[0]))
+    order = {"added": 0, "terminated": 1, "changed": 2}
+    changes.sort(key=lambda c: (order[c["kind"]], c["customer"].lower(), c["serial"]))
     return changes
 
 
 # -------------------------------------------------------------------- email
 
-def build_csv(changes):
+def _row_values(c):
+    return [KIND_LABEL[c["kind"]], c["customer"], crm_link(c), c["serial"], device_link(c),
+            c["old_plan"], c["new_plan"]] + list(c["fields"].values())
+
+
+def _row_headers(source):
+    return (["Change", "Customer", "CRM Link", "Serial", "Device Link", "Old Plan", "New Plan"]
+            + [lab for lab, _, _ in source.get("columns", [])])
+
+
+def build_csv(source, changes):
     buf = io.StringIO(newline="")
     w = csv.writer(buf, lineterminator="\n")
-    w.writerow(["serial_number", "customer", "old_plan", "new_plan"])
-    w.writerows(changes)
+    w.writerow(_row_headers(source))
+    for c in changes:
+        w.writerow(_row_values(c))
     return buf.getvalue()
 
 
-_google = None
+def build_xlsx(results):
+    """report.xlsx with one sheet per source (Geotab, Zenduit). Returns bytes,
+    or None if openpyxl is not installed (the CSVs are attached instead)."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        say("openpyxl not installed - attaching CSVs instead of report.xlsx")
+        return None
+    wb = Workbook()
+    wb.remove(wb.active)
+    for r in results:
+        ws = wb.create_sheet(r["label"][:31])
+        headers = _row_headers(r["source"])
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor=BRAND)
+            cell.alignment = Alignment(vertical="center")
+        for c in r["changes"]:
+            ws.append(_row_values(c))
+            row = ws.max_row
+            for col_idx, header in enumerate(headers, start=1):
+                v = ws.cell(row=row, column=col_idx).value
+                if header in ("CRM Link", "Device Link") and v:
+                    ws.cell(row=row, column=col_idx).hyperlink = v
+                    ws.cell(row=row, column=col_idx).font = Font(color="0563C1", underline="single")
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for col_idx, header in enumerate(headers, start=1):
+            width = max([len(str(header))] + [len(str(ws.cell(row=i, column=col_idx).value or ""))
+                                               for i in range(2, min(ws.max_row, 300) + 1)])
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(10, width + 2), 60)
+        if not r["changes"]:
+            ws.append(["No changes" if not r["first_run"] else "Baseline created - nothing to compare yet"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 def google_client():
@@ -453,7 +631,8 @@ def build_message(subject, html, text, attachments=()):
     body.attach(MIMEText(html, "html"))
     msg.attach(body)
     for name, content in attachments:
-        part = MIMEApplication(content.encode("utf-8"), Name=name)
+        data = content if isinstance(content, (bytes, bytearray)) else content.encode("utf-8")
+        part = MIMEApplication(data, Name=name)
         part["Content-Disposition"] = f'attachment; filename="{name}"'
         msg.attach(part)
     return msg
@@ -487,7 +666,7 @@ def send_via_smtp(msg):
 
 
 def send_mail(subject, html, text, attachments=()):
-    """attachments: iterable of (filename, body_text).
+    """attachments: iterable of (filename, text or bytes).
 
     MAIL_VIA=gmail_api (default whenever a Google refresh token is configured)
     sends through the Gmail API; MAIL_VIA=smtp uses SMTP with the app password.
@@ -508,74 +687,167 @@ def send_mail(subject, html, text, attachments=()):
     say(f"Emailed {', '.join(MAIL_TO)} (SMTP)")
 
 
-def report_note(result):
-    """Footer line under a section: where the full CSV for that source is."""
-    if STORAGE == "gdrive":
-        return (f"Full list attached as plan_changes_{result['key']}.csv "
-                f"(also on the GitHub run page under Artifacts).")
-    return f"Report saved to {result['report_path']}"
+KIND_LABEL = {"added": "Added", "terminated": "Terminated", "changed": "Plan Change"}
+SECTION_TITLE = {"added": "Newly Added Devices", "terminated": "Terminated Devices",
+                 "changed": "Plan Changes"}
+BRAND = env("EMAIL_BRAND_COLOR", "1F3A5F")       # header band + table header (hex, no #)
+ROW_CAP = int(env("EMAIL_ROW_CAP", "150"))      # rows per table in the email body; the rest is in report.xlsx
 
 
-def section_html(result):
-    """One source's block of the email body."""
-    label = result["label"]
+def esc(v):
+    return html_mod.escape(str(v if v is not None else ""), quote=True)
+
+
+def crm_link(c):
+    cid = (c.get("crm_id") or "").strip()
+    return CRM_ACCOUNT_URL.format(crm_id=cid) if cid.isdigit() and CRM_ACCOUNT_URL else ""
+
+
+def device_link(c):
+    tpl = c.get("_device_url") or ""
+    if not tpl:
+        return ""
+    try:
+        url = tpl.format(**{k: urllib.parse.quote(str(v or ""), safe="") for k, v in c["url"].items()})
+    except (KeyError, IndexError):
+        return ""
+    return "" if "{" in url else url
+
+
+def a(text, url):
+    text = esc(text) if text else "-"
+    return f'<a href="{esc(url)}" style="color:#1a5fb4;text-decoration:none">{text}</a>' if url else text
+
+
+def tile(number, caption, color="#1a5fb4"):
+    return (f"<td style='padding:0 6px'><table role='presentation' cellpadding='0' cellspacing='0' "
+            f"style='width:100%;background:#f4f6fa;border-radius:8px'><tr><td style='padding:14px 10px;text-align:center'>"
+            f"<div style='font-size:26px;font-weight:700;color:{color};line-height:1'>{number}</div>"
+            f"<div style='font-size:11px;color:#5b6472;text-transform:uppercase;letter-spacing:.04em;margin-top:6px'>{caption}</div>"
+            f"</td></tr></table></td>")
+
+
+def tiles_row(changes):
+    n_add = sum(1 for c in changes if c["kind"] == "added")
+    n_term = sum(1 for c in changes if c["kind"] == "terminated")
+    n_chg = sum(1 for c in changes if c["kind"] == "changed")
+    n_cust = len({c["customer"].lower() for c in changes if c["customer"]})
+    return (f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;margin:14px 0 6px'><tr>"
+            f"{tile(n_add, 'Devices Added', '#1a7f4b')}{tile(n_term, 'Terminated', '#b3261e')}"
+            f"{tile(n_chg, 'Plan Changes', '#1a5fb4')}{tile(n_cust, 'Customers', '#5b6472')}</tr></table>")
+
+
+def table_html(source, rows, kind):
+    th = (f"padding:7px 9px;background:#{BRAND};color:#fff;font-size:12px;text-align:left;"
+          "white-space:nowrap;border-right:1px solid rgba(255,255,255,.15)")
+    td = "padding:6px 9px;border-bottom:1px solid #e3e6eb;font-size:12px;vertical-align:top"
+    extra = [lab for lab, _, _ in source.get("columns", [])]
+    plan_head = "Device Plan" if kind != "changed" else "Plan (old &rarr; new)"
+    head = "".join(f"<th style='{th}'>{h}</th>" for h in
+                   ["Customer", "Serial", plan_head] + extra)
+    body = []
+    for i, c in enumerate(rows[:ROW_CAP]):
+        bg = "#ffffff" if i % 2 == 0 else "#f8f9fb"
+        if kind == "changed":
+            plan = f"{esc(c['old_plan'])} &rarr; <b>{esc(c['new_plan'])}</b>"
+        elif kind == "added":
+            plan = f"<b>{esc(c['new_plan'])}</b>"
+        else:
+            plan = (f"<span style='color:#b3261e'>{esc(c['new_plan'])}</span> "
+                    f"<span style='color:#8a94a3'>(was {esc(c['old_plan'])})</span>")
+        cells = [a(c["customer"], crm_link(c)),
+                 f"<span style='font-family:Consolas,Menlo,monospace'>"
+                 f"{a(c['serial'] if c.get('has_serial', True) else '-', device_link(c))}</span>",
+                 plan] + [esc(v) or "-" for v in c["fields"].values()]
+        body.append(f"<tr style='background:{bg}'>" + "".join(f"<td style='{td}'>{x}</td>" for x in cells) + "</tr>")
+    more = (f"<p style='font-size:12px;color:#5b6472;margin:6px 0 0'>&hellip; and {len(rows) - ROW_CAP} more "
+            f"in the attached report.</p>" if len(rows) > ROW_CAP else "")
+    return (f"<h3 style='font-size:14px;margin:18px 0 6px;color:#1f2a37'>{SECTION_TITLE[kind]} "
+            f"<span style='color:#8a94a3;font-weight:400'>({len(rows)})</span></h3>"
+            f"<div style='overflow-x:auto'><table cellpadding='0' cellspacing='0' "
+            f"style='border-collapse:collapse;width:100%;min-width:760px'>"
+            f"<tr>{head}</tr>{''.join(body)}</table></div>{more}")
+
+
+def source_html(result):
+    label, src = result["label"], result["source"]
+    head = (f"<h2 style='font-size:17px;margin:28px 0 4px;padding-top:18px;border-top:2px solid #e3e6eb;"
+            f"color:#1f2a37'>{esc(label)}</h2>")
     if result["first_run"]:
-        return (f"<h3 style='margin:18px 0 6px'>{label}</h3>"
-                f"<p>No baseline existed for {label}. Created <b>{result['baseline_name']}</b> "
-                f"with {result['count']} devices; nothing to compare yet. The next run will "
-                f"report changes against it.</p>")
+        return head + (f"<p style='font-size:13px;color:#5b6472'>No baseline existed for {esc(label)}; created "
+                       f"<b>{esc(result['baseline_name'])}</b> with {result['count']:,} devices. Changes will be "
+                       f"reported from the next run.</p>")
     changes = result["changes"]
     if not changes:
-        return (f"<h3 style='margin:18px 0 6px'>{label}</h3>"
-                f"<p>No plan changes vs <b>{result['baseline_name']}</b>.</p>")
-    rows = "".join(
-        "<tr>"
-        f"<td style='{TD};font-family:monospace'>{s}</td>"
-        f"<td style='{TD}'>{c or '-'}</td>"
-        f"<td style='{TD}'>{o}</td>"
-        f"<td style='{TD};font-weight:600'>{n}</td>"
-        "</tr>" for s, c, o, n in changes[:500])
-    more = (f"<p>...and {len(changes) - 500} more. Full list is in the attached CSV.</p>"
-            if len(changes) > 500 else "")
-    th = f"{TD};text-align:left"
-    return (f"<h3 style='margin:18px 0 6px'>{label}</h3>"
-            f"<p><b>{len(changes)}</b> device(s) have a different plan than in "
-            f"<b>{result['baseline_name']}</b>.</p>"
-            f"<table style='border-collapse:collapse;font-size:13px'>"
-            f"<tr style='background:#eee'><th style='{th}'>Serial</th>"
-            f"<th style='{th}'>Customer</th><th style='{th}'>Old plan</th>"
-            f"<th style='{th}'>New plan</th></tr>{rows}</table>{more}"
-            f"<p style='color:#777;font-size:11px'>{report_note(result)}</p>")
+        return head + f"<p style='font-size:13px;color:#5b6472'>No device plan changes.</p>"
+    out = head + tiles_row(changes)
+    for kind in ("added", "terminated", "changed"):
+        rows = [c for c in changes if c["kind"] == kind]
+        if rows:
+            out += table_html(src, rows, kind)
+    return out
 
 
-def section_text(result):
-    label = result["label"]
-    if result["first_run"]:
-        return (f"== {label} ==\nNo baseline existed. Created {result['baseline_name']} with "
-                f"{result['count']} devices; nothing to compare yet.\n")
-    changes = result["changes"]
-    if not changes:
-        return f"== {label} ==\nNo plan changes vs {result['baseline_name']}.\n"
-    return (f"== {label} ==\n{len(changes)} device(s) changed plan vs {result['baseline_name']}:\n\n"
-            + "\n".join(f"  {s}  ({c or '-'})  {o} -> {n}" for s, c, o, n in changes)
-            + f"\n\n{report_note(result)}\n")
+def digest_html(results, when):
+    all_changes = [c for r in results for c in r["changes"]]
+    labels = " &amp; ".join(esc(r["label"]) for r in results)
+    intro = (f"Device activations, terminations and plan changes since the previous run, "
+             f"for {labels}. Customer names open the Zoho CRM account; serial numbers open the "
+             f"device page where a link is configured. The full breakdown is attached as "
+             f"<b>report.xlsx</b> (one sheet per source).")
+    return (f"<html><body style='margin:0;padding:0;background:#eef1f5'>"
+            f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;background:#eef1f5'><tr><td align='center' style='padding:18px 8px'>"
+            f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;max-width:1100px;background:#fff;border-radius:10px;overflow:hidden;font-family:Segoe UI,Helvetica,Arial,sans-serif;color:#1f2a37'>"
+            f"<tr><td style='background:#{BRAND};padding:18px 24px'>"
+            f"<div style='font-size:11px;letter-spacing:.12em;color:#c9d4e3;text-transform:uppercase'>Device Billing Update</div>"
+            f"<div style='font-size:20px;font-weight:700;color:#fff;margin-top:4px'>{labels} &middot; Daily</div>"
+            f"<div style='font-size:12px;color:#c9d4e3;margin-top:4px'>{esc(when)}</div></td></tr>"
+            f"<tr><td style='padding:18px 24px 26px'>"
+            f"<p style='font-size:13px;line-height:1.5;margin:0'>{intro}</p>"
+            f"{tiles_row(all_changes) if len(results) > 1 else ''}"
+            f"{''.join(source_html(r) for r in results)}"
+            f"</td></tr></table></td></tr></table></body></html>")
+
+
+def digest_text(results, when):
+    lines = [f"Device billing update - {' & '.join(r['label'] for r in results)} - {when}", ""]
+    for r in results:
+        lines.append(f"== {r['label']} ==")
+        if r["first_run"]:
+            lines.append(f"Baseline created with {r['count']} devices; nothing to compare yet.")
+        elif not r["changes"]:
+            lines.append("No device plan changes.")
+        for kind in ("added", "terminated", "changed"):
+            rows = [c for c in r["changes"] if c["kind"] == kind]
+            if rows:
+                lines.append(f"-- {SECTION_TITLE[kind]} ({len(rows)})")
+                lines += [f"  {c['serial']}  ({c['customer'] or '-'})  {c['old_plan']} -> {c['new_plan']}"
+                          for c in rows]
+        lines.append("")
+    lines.append("Full breakdown attached as report.xlsx.")
+    return "\n".join(lines)
 
 
 def email_results(results):
     """One email, a section per source in SOURCES order (Geotab, then Zenduit)."""
-    counts = ", ".join(f"{len(r['changes'])} {r['label']}" for r in results if not r["first_run"])
+    when = time.strftime("%b %d, %Y %H:%M UTC", time.gmtime())
+    counts = [f"{sum(1 for c in r['changes'] if c['kind'] == 'added')} added, "
+              f"{sum(1 for c in r['changes'] if c['kind'] == 'terminated')} terminated, "
+              f"{sum(1 for c in r['changes'] if c['kind'] == 'changed')} plan changes"
+              for r in results if not r["first_run"]]
     created = [r["label"] for r in results if r["first_run"]]
-    subject = f"Device plan changes - {counts}" if counts else "Device plan check"
+    subject = "Device billing changes - " + " & ".join(r["label"] for r in results) + " (Daily)"
     if created:
-        subject += f" (baseline created: {', '.join(created)})"
-
-    html = ("<html><body style='font-family:sans-serif;font-size:14px'>"
-            + "".join(section_html(r) for r in results)
-            + "</body></html>")
-    text = "\n".join(section_text(r) for r in results)
-    attachments = [(f"plan_changes_{r['key']}.csv", build_csv(r["changes"]))
-                   for r in results if r["changes"]]
-    send_mail(subject, html, text, attachments)
+        subject += f" - baseline created: {', '.join(created)}"
+    xlsx = build_xlsx(results)
+    if xlsx:
+        attachments = [("report.xlsx", xlsx)]
+    else:
+        attachments = [(f"plan_changes_{r['key']}.csv", build_csv(r["source"], r["changes"]))
+                       for r in results if r["changes"]]
+    say("Email summary: " + "; ".join(f"{r['label']}: {c}" for r, c in
+                                       zip([r for r in results if not r["first_run"]], counts)))
+    send_mail(subject, digest_html(results, when), digest_text(results, when), attachments)
 
 
 def email_failure(err):
@@ -694,10 +966,15 @@ def process_source(source, token, include_never):
         return result
 
     old = to_plan_map(read_local_csv(baseline_path), source, f"OLD {label} ({source['baseline']})")
-    changes = compare(old, new, include_never_activated=include_never, label=label)
-    say(f"[{label}] {len(changes)} device(s) with a different plan")
-    for s, c, o, n in changes[:50]:
-        say(f"    {s}  ({c or '-'})  {o} -> {n}")
+    changes = compare(old, new, include_never_activated=include_never, label=label,
+                      terminated_plans=source.get("terminated_plans", ()))
+    for c in changes:
+        c["_device_url"] = source.get("device_url", "")
+    kinds = collections.Counter(c["kind"] for c in changes)
+    say(f"[{label}] {len(changes)} change(s): {kinds.get('added', 0)} added, "
+        f"{kinds.get('terminated', 0)} terminated, {kinds.get('changed', 0)} plan changes")
+    for c in changes[:50]:
+        say(f"    {KIND_LABEL[c['kind']]:<11} {c['serial']}  ({c['customer'] or '-'})  {c['old_plan']} -> {c['new_plan']}")
     if len(changes) > 50:
         say(f"    ... and {len(changes) - 50} more")
 
@@ -705,7 +982,7 @@ def process_source(source, token, include_never):
         report_path = os.path.join(
             DISCREPANCY_DIR, f"plan_changes_{source['key']}_{time.strftime('%Y%m%d_%H%M')}.csv")
         with open(report_path, "w", encoding="utf-8", newline="") as fh:
-            fh.write(build_csv(changes))
+            fh.write(build_csv(source, changes))
         say(f"[{label}] Wrote {report_path}")
         result["report_path"] = report_path
     result["changes"] = changes
