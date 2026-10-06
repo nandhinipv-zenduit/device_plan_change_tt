@@ -9,6 +9,7 @@ differs. One email per run, Geotab section first, then Zenduit.
     python main.py                 # the daily check
     python main.py get-token       # one-off: mint the Google refresh token (Drive + Gmail send)
     python main.py check-token     # one-off: test a refresh token against the Drive folder
+    python main.py zoho-token CODE # one-off: mint the Zoho CRM refresh token from a grant code
 
 THE FILES ALWAYS LIVE IN GOOGLE DRIVE
     My Drive\Device_discrepancy
@@ -94,6 +95,7 @@ import http.server
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import smtplib
@@ -165,6 +167,17 @@ CRM_ACCOUNT_URL = env("CRM_ACCOUNT_URL", f"https://crm.zoho.com/crm/org{CRM_ORG}
 GEOTAB_DEVICE_URL = env("GEOTAB_DEVICE_URL", "")
 ZENDUIT_DEVICE_URL = env("ZENDUIT_DEVICE_URL", "")
 
+# Zoho CRM cancellation requests. Each terminated device is looked up in the
+# CRM "Cancellations" module (custom module CustomModule3) and its "Cancelled
+# Items" subform (Subform_2), where the serials are typed in. Needs a Zoho
+# refresh token with CRM read scopes (ZohoCRM.modules.READ, ZohoCRM.coql.READ);
+# `python main.py zoho-token <grant code>` mints one. Without the token the
+# lookup is skipped and the email says so.
+CRM_LOOKBACK_DAYS = int(env("CRM_LOOKBACK_DAYS", "180"))
+CRM_API = env("ZOHO_CRM_API", "https://www.zohoapis.com/crm/v8")
+CRM_CANCELLATION_URL = env("CRM_CANCELLATION_URL",
+                           f"https://crm.zoho.com/crm/org{CRM_ORG}/tab/CustomModule3/{{id}}")
+
 # One entry per device family. Order here is the order of the email sections
 # and of everything in the log: Geotab first, Zenduit second.
 #
@@ -179,6 +192,8 @@ ZENDUIT_DEVICE_URL = env("ZENDUIT_DEVICE_URL", "")
 #   plan_cols      exact column names tried first for the plan
 #   customer_cols  exact column names tried first for the customer (optional)
 #   crm_id_cols    column holding the Zoho CRM Account id (optional)
+#   alt_id_cols    other identifiers (SIM, modem serial...) matched against
+#                  CRM cancellation requests besides the serial
 #   blank_plans    plan values that mean "no plan" (lower-cased)
 #   terminated_plans  plan values that mean the device was terminated
 #   device_url     link template for the serial (see above)
@@ -199,6 +214,8 @@ SOURCES = [
         "plan_cols": ["activeDevicePlan_name"],
         "customer_cols": ["userContact_userCompany_name", "Customer", "Customer Name"],
         "crm_id_cols": ["userContact_userCompany_partnerCustomerId"],
+        # other identifiers a cancellation request might quote for this device
+        "alt_id_cols": ["device_modemSerialNo", "simCardNumber", "Hardware ID"],
         "blank_plans": {""},
         "terminated_plans": set(),
         "device_url": GEOTAB_DEVICE_URL,
@@ -234,6 +251,7 @@ SOURCES = [
         "customer_cols": ["Company_Name", "Customer", "Customer Name", "customer",
                           "customer_name", "Company", "company", "company_name"],
         "crm_id_cols": ["AccountId"],
+        "alt_id_cols": ["SIM", "Serial", "Third_Party_Serial", "Device_Name"],
         "blank_plans": {"", "none", "null"},
         "terminated_plans": {"terminated"},
         "device_url": ZENDUIT_DEVICE_URL,
@@ -255,6 +273,10 @@ ORG_ID = env("ZOHO_ORG_ID", "67409019")
 A_ID = env("ZOHO_CLIENT_ID_ANALYTICS")
 A_SECRET = env("ZOHO_CLIENT_SECRET_ANALYTICS")
 A_REFRESH = env("ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS")
+# CRM token: same client as Analytics unless a separate one is given.
+CRM_ID = env("ZOHO_CLIENT_ID_CRM", A_ID)
+CRM_SECRET = env("ZOHO_CLIENT_SECRET_CRM", A_SECRET)
+CRM_REFRESH = env("ZOHO_CLIENT_REFRESH_TOKEN_CRM")
 
 SMTP_HOST = env("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(env("SMTP_PORT", "587"))
@@ -336,6 +358,7 @@ def to_plan_map(text, source, label):
     extra = [(lab, next((c for c in cands if c in cols), ""), kind)
              for lab, cands, kind in source.get("columns", [])]
     url_fields = {k: v for k, v in source.get("url_fields", {}).items() if v in cols}
+    alt_cols = [c for c in source.get("alt_id_cols", []) if c in cols]
     blank_plans = source.get("blank_plans") or {""}
 
     def val(r, c):
@@ -360,6 +383,7 @@ def to_plan_map(text, source, label):
             "serial": serial or key,
             "has_serial": bool(serial),
             "crm_id": val(r, crm_col),
+            "alt_ids": [val(r, c) for c in alt_cols if val(r, c)],
             "fields": {lab: fmt_field(val(r, c), kind) for lab, c, kind in extra},
             "url": {**{k: val(r, c) for k, c in url_fields.items()},
                     "serial": serial or key, "crm_id": val(r, crm_col)},
@@ -510,7 +534,7 @@ def compare(old, new, include_never_activated=False, label="", terminated_plans=
 
     def rec(kind, info, old_plan, new_plan):
         return {"kind": kind, "serial": info["serial"], "has_serial": info.get("has_serial", True),
-                "customer": info["customer"],
+                "alt_ids": info.get("alt_ids", []), "customer": info["customer"],
                 "crm_id": info["crm_id"], "old_plan": old_plan or "(none)",
                 "new_plan": new_plan or "(none)", "fields": info["fields"], "url": info["url"]}
 
@@ -551,16 +575,188 @@ def compare(old, new, include_never_activated=False, label="", terminated_plans=
     return changes
 
 
+
+# -------------------------------------------------- CRM cancellation requests
+
+def norm_id(v):
+    """'8988228066 -605985813' -> '8988228066605985813'; 'g9 3221111410' -> 'G93221111410'."""
+    return re.sub(r"[^A-Z0-9]", "", str(v or "").upper())
+
+
+def serial_keys(text):
+    """Every plausible identifier in a free-text serial field.
+
+    People type one serial per line, but also '8988228066 -605985813' or
+    'gaby 1V3H49YT', so each line is indexed both as a whole (all punctuation
+    and spaces removed) and as its individual tokens."""
+    keys = set()
+    for line in re.split(r"[\r\n,;/]+", str(text or "")):
+        whole = norm_id(line)
+        if len(whole) >= 6:
+            keys.add(whole)
+        for tok in line.split():
+            t = norm_id(tok)
+            if len(t) >= 6:
+                keys.add(t)
+    return keys
+
+
+def crm_token():
+    if not (CRM_ID and CRM_SECRET and CRM_REFRESH):
+        return ""
+    r = requests.post("https://accounts.zoho.com/oauth/v2/token", data={
+        "grant_type": "refresh_token", "client_id": CRM_ID,
+        "client_secret": CRM_SECRET, "refresh_token": CRM_REFRESH}, timeout=60)
+    if r.status_code >= 400 or not r.json().get("access_token"):
+        raise RuntimeError(f"CRM token refresh failed: {r.status_code} {r.text[:200]}")
+    return r.json()["access_token"]
+
+
+def crm_coql_all(token, select_cols, module, where):
+    """Run a COQL query and page through every row (ordered by id)."""
+    rows, last_id = [], None
+    while True:
+        cond = where + (f" and id > {last_id}" if last_id else "")
+        q = f"select {select_cols} from {module} where {cond} order by id asc limit 2000"
+        r = requests.post(f"{CRM_API}/coql", headers={"Authorization": f"Zoho-oauthtoken {token}"},
+                          json={"select_query": q}, timeout=(30, 120))
+        if r.status_code == 204:
+            return rows
+        if r.status_code >= 400:
+            raise RuntimeError(f"CRM COQL failed ({module}): {r.status_code} {r.text[:300]}")
+        body = r.json()
+        page = body.get("data") or []
+        rows.extend(page)
+        if not page or not (body.get("info") or {}).get("more_records"):
+            return rows
+        last_id = page[-1]["id"]
+
+
+def load_cancellations():
+    """Cancellation requests touched in the last CRM_LOOKBACK_DAYS days.
+
+    Returns (index, requests, blobs):
+        index    normalised serial/SIM -> [cancellation id, ...]
+        requests cancellation id -> summary dict
+        blobs    cancellation id -> normalised free text (notes + top-level
+                 serial field) for a fallback substring match
+    """
+    token = crm_token()
+    since = (datetime.datetime.now(datetime.timezone.utc)
+             - datetime.timedelta(days=CRM_LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    heads = crm_coql_all(token,
+        "Name, Cancellation_ID, Account_Name, Churn, Cancellation_Status, Finance_Cancellation_Status, "
+        "Cancellation_Request_Date, Finance_Cancellation_Status_Timestamp, Ticket_URL, Platform_Affected, "
+        "Serial_Numbers, Cancellation_Details_Notes, Additional_Notes",
+        "Cancellations", f"Modified_Time >= '{since}'")
+    items = crm_coql_all(token, "Parent_Id, Serial_Numbers, Vendor_Plan, Qty",
+                         "Subform_2", f"Modified_Time >= '{since}'")
+
+    requests_by_id, blobs, index = {}, {}, collections.defaultdict(list)
+    for h in heads:
+        cid = h["id"]
+        acct = h.get("Account_Name") or {}
+        requests_by_id[cid] = {
+            "id": cid, "ref": h.get("Cancellation_ID") or "", "ticket": h.get("Name") or "",
+            "account": acct.get("name", "") if isinstance(acct, dict) else str(acct or ""),
+            "type": h.get("Churn") or "", "status": h.get("Cancellation_Status") or "",
+            "finance_status": h.get("Finance_Cancellation_Status") or "",
+            "requested": h.get("Cancellation_Request_Date") or "",
+            "processed": (h.get("Finance_Cancellation_Status_Timestamp") or "")[:10],
+            "ticket_url": h.get("Ticket_URL") or "",
+            "url": CRM_CANCELLATION_URL.format(id=cid),
+            "platform": ", ".join(h.get("Platform_Affected") or []),
+        }
+        blobs[cid] = norm_id(" ".join(str(h.get(k) or "") for k in
+                                      ("Serial_Numbers", "Cancellation_Details_Notes", "Additional_Notes")))
+        for key in serial_keys(h.get("Serial_Numbers")):
+            index[key].append(cid)
+    for it in items:
+        parent = (it.get("Parent_Id") or {}).get("id")
+        if not parent:
+            continue
+        for key in serial_keys(it.get("Serial_Numbers")):
+            index[key].append(parent)
+        if parent not in requests_by_id:          # subform row whose parent is older than the window
+            requests_by_id[parent] = {"id": parent, "ref": "", "ticket": "", "account": "", "type": "",
+                                      "status": "", "finance_status": "", "requested": "", "processed": "",
+                                      "ticket_url": "", "url": CRM_CANCELLATION_URL.format(id=parent),
+                                      "platform": ""}
+    say(f"CRM: {len(heads)} cancellation request(s) and {len(items)} cancelled-item row(s) in the last "
+        f"{CRM_LOOKBACK_DAYS} days; {len(index)} distinct serial/SIM references")
+    return index, requests_by_id, blobs
+
+
+def match_cancellation(change, index, requests_by_id, blobs):
+    keys = [norm_id(change["serial"])] + [norm_id(a) for a in change.get("alt_ids", [])]
+    keys = [k for k in keys if len(k) >= 6]
+    for k in keys:
+        if k in index:
+            return [requests_by_id[cid] for cid in dict.fromkeys(index[k])]
+    # fallback: the serial typed somewhere in the notes
+    for k in keys:
+        if len(k) >= 8:
+            hits = [cid for cid, blob in blobs.items() if k in blob]
+            if hits:
+                return [requests_by_id[cid] for cid in hits]
+    return []
+
+
+def annotate_cancellations(results):
+    """Attach c["cancellations"] (list, possibly empty) to every change and
+    c["crm_checked"] = True; on any failure mark crm_checked False and move on —
+    the email must still go out."""
+    changes = [c for r in results for c in r["changes"]]
+    if not changes:
+        return
+    if not CRM_REFRESH:
+        say("CRM: ZOHO_CLIENT_REFRESH_TOKEN_CRM not set - cancellation requests not checked")
+        for c in changes:
+            c["cancellations"], c["crm_checked"] = [], False
+        return
+    try:
+        index, reqs, blobs = load_cancellations()
+    except Exception as exc:
+        say(f"CRM: lookup FAILED ({exc}) - continuing without cancellation requests")
+        for c in changes:
+            c["cancellations"], c["crm_checked"] = [], False
+        return
+    found = 0
+    for c in changes:
+        c["cancellations"] = match_cancellation(c, index, reqs, blobs)
+        c["crm_checked"] = True
+        found += bool(c["cancellations"])
+    terminated = [c for c in changes if c["kind"] == "terminated"]
+    say(f"CRM: {sum(1 for c in terminated if c['cancellations'])} of {len(terminated)} terminated device(s) "
+        f"have a cancellation request; {found - sum(1 for c in terminated if c['cancellations'])} other "
+        f"change(s) also reference one")
+
+
+def cancel_text(c):
+    """Short plain-text summary of a change's cancellation match."""
+    if not c.get("crm_checked"):
+        return "not checked"
+    if not c.get("cancellations"):
+        return "NO REQUEST FOUND"
+    return "; ".join(f"{q['ref'] or q['id']} {q['ticket']} - {q['status']}"
+                     f"{' / ' + q['finance_status'] if q['finance_status'] else ''}"
+                     f"{' (req ' + q['requested'] + ')' if q['requested'] else ''}"
+                     for q in c["cancellations"])
+
+
 # -------------------------------------------------------------------- email
 
 def _row_values(c):
-    return [KIND_LABEL[c["kind"]], c["customer"], crm_link(c), c["serial"], device_link(c),
-            c["old_plan"], c["new_plan"]] + list(c["fields"].values())
+    q = (c.get("cancellations") or [None])[0]
+    return ([KIND_LABEL[c["kind"]], c["customer"], crm_link(c), c["serial"], device_link(c),
+             c["old_plan"], c["new_plan"]] + list(c["fields"].values())
+            + [cancel_text(c), q["url"] if q else "", q["ticket_url"] if q else ""])
 
 
 def _row_headers(source):
     return (["Change", "Customer", "CRM Link", "Serial", "Device Link", "Old Plan", "New Plan"]
-            + [lab for lab, _, _ in source.get("columns", [])])
+            + [lab for lab, _, _ in source.get("columns", [])]
+            + ["Cancellation Request", "Cancellation Link", "Ticket Link"])
 
 
 def build_csv(source, changes):
@@ -597,7 +793,7 @@ def build_xlsx(results):
             row = ws.max_row
             for col_idx, header in enumerate(headers, start=1):
                 v = ws.cell(row=row, column=col_idx).value
-                if header in ("CRM Link", "Device Link") and v:
+                if header in ("CRM Link", "Device Link", "Cancellation Link", "Ticket Link") and v:
                     ws.cell(row=row, column=col_idx).hyperlink = v
                     ws.cell(row=row, column=col_idx).font = Font(color="0563C1", underline="single")
         ws.freeze_panes = "A2"
@@ -691,10 +887,7 @@ def send_mail(subject, html, text, attachments=()):
 
 
 KIND_LABEL = {"added": "Added", "terminated": "Terminated", "changed": "Plan Change"}
-SECTION_TITLE = {"added": "Newly Added Devices", "terminated": "Terminated Devices",
-                 "changed": "Plan Changes"}
 BRAND = env("EMAIL_BRAND_COLOR", "1F3A5F")       # header band + table header (hex, no #)
-ROW_CAP = int(env("EMAIL_ROW_CAP", "150"))      # rows per table in the email body; the rest is in report.xlsx
 
 
 def esc(v):
@@ -722,92 +915,77 @@ def a(text, url):
     return f'<a href="{esc(url)}" style="color:#1a5fb4;text-decoration:none">{text}</a>' if url else text
 
 
-def tile(number, caption, color="#1a5fb4"):
-    return (f"<td style='padding:0 6px'><table role='presentation' cellpadding='0' cellspacing='0' "
-            f"style='width:100%;background:#f4f6fa;border-radius:8px'><tr><td style='padding:14px 10px;text-align:center'>"
-            f"<div style='font-size:26px;font-weight:700;color:{color};line-height:1'>{number}</div>"
+def counts(changes):
+    return {"added": sum(1 for c in changes if c["kind"] == "added"),
+            "terminated": sum(1 for c in changes if c["kind"] == "terminated"),
+            "changed": sum(1 for c in changes if c["kind"] == "changed"),
+            "customers": len({c["customer"].lower() for c in changes if c["customer"]}),
+            "no_request": sum(1 for c in changes if c["kind"] == "terminated"
+                              and c.get("crm_checked") and not c.get("cancellations"))}
+
+
+CARD_COLORS = {"added": "#1a7f4b", "terminated": "#b3261e", "changed": "#1a5fb4"}
+CARD_LABELS = {"added": "Devices Added", "terminated": "Terminated", "changed": "Plan Changes"}
+
+
+def card_html(number, caption, color, note=""):
+    return (f"<td style='padding:0 6px;width:33%'><table role='presentation' cellpadding='0' cellspacing='0' "
+            f"style='width:100%;background:#f4f6fa;border-radius:8px;border-bottom:3px solid {color}'>"
+            f"<tr><td style='padding:16px 10px;text-align:center'>"
+            f"<div style='font-size:30px;font-weight:700;color:{color};line-height:1'>{number}</div>"
             f"<div style='font-size:11px;color:#5b6472;text-transform:uppercase;letter-spacing:.04em;margin-top:6px'>{caption}</div>"
+            f"{f'<div style=font-size:11px;color:#b3261e;margin-top:4px>{note}</div>' if note else ''}"
             f"</td></tr></table></td>")
 
 
-def tiles_row(changes):
-    n_add = sum(1 for c in changes if c["kind"] == "added")
-    n_term = sum(1 for c in changes if c["kind"] == "terminated")
-    n_chg = sum(1 for c in changes if c["kind"] == "changed")
-    n_cust = len({c["customer"].lower() for c in changes if c["customer"]})
-    return (f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;margin:14px 0 6px'><tr>"
-            f"{tile(n_add, 'Devices Added', '#1a7f4b')}{tile(n_term, 'Terminated', '#b3261e')}"
-            f"{tile(n_chg, 'Plan Changes', '#1a5fb4')}{tile(n_cust, 'Customers', '#5b6472')}</tr></table>")
-
-
-def table_html(source, rows, kind):
-    th = (f"padding:7px 9px;background:#{BRAND};color:#fff;font-size:12px;text-align:left;"
-          "white-space:nowrap;border-right:1px solid rgba(255,255,255,.15)")
-    td = "padding:6px 9px;border-bottom:1px solid #e3e6eb;font-size:12px;vertical-align:top"
-    extra = [lab for lab, _, _ in source.get("columns", [])]
-    plan_head = "Device Plan" if kind != "changed" else "Plan (old &rarr; new)"
-    head = "".join(f"<th style='{th}'>{h}</th>" for h in
-                   ["Customer", "Serial", plan_head] + extra)
-    body = []
-    for i, c in enumerate(rows[:ROW_CAP]):
-        bg = "#ffffff" if i % 2 == 0 else "#f8f9fb"
-        if kind == "changed":
-            plan = f"{esc(c['old_plan'])} &rarr; <b>{esc(c['new_plan'])}</b>"
-        elif kind == "added":
-            plan = f"<b>{esc(c['new_plan'])}</b>"
-        else:
-            plan = (f"<span style='color:#b3261e'>{esc(c['new_plan'])}</span> "
-                    f"<span style='color:#8a94a3'>(was {esc(c['old_plan'])})</span>")
-        cells = [a(c["customer"], crm_link(c)),
-                 f"<span style='font-family:Consolas,Menlo,monospace'>"
-                 f"{a(c['serial'] if c.get('has_serial', True) else '-', device_link(c))}</span>",
-                 plan] + [esc(v) or "-" for v in c["fields"].values()]
-        body.append(f"<tr style='background:{bg}'>" + "".join(f"<td style='{td}'>{x}</td>" for x in cells) + "</tr>")
-    more = (f"<p style='font-size:12px;color:#5b6472;margin:6px 0 0'>&hellip; and {len(rows) - ROW_CAP} more "
-            f"in the attached report.</p>" if len(rows) > ROW_CAP else "")
-    return (f"<h3 style='font-size:14px;margin:18px 0 6px;color:#1f2a37'>{SECTION_TITLE[kind]} "
-            f"<span style='color:#8a94a3;font-weight:400'>({len(rows)})</span></h3>"
-            f"<div style='overflow-x:auto'><table cellpadding='0' cellspacing='0' "
-            f"style='border-collapse:collapse;width:100%;min-width:760px'>"
-            f"<tr>{head}</tr>{''.join(body)}</table></div>{more}")
+def cards_row(changes):
+    n = counts(changes)
+    note = f"{n['no_request']} without a cancellation request" if n["no_request"] else ""
+    return ("<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;margin:12px 0 4px'><tr>"
+            + card_html(n["added"], CARD_LABELS["added"], CARD_COLORS["added"])
+            + card_html(n["terminated"], CARD_LABELS["terminated"], CARD_COLORS["terminated"], note)
+            + card_html(n["changed"], CARD_LABELS["changed"], CARD_COLORS["changed"])
+            + "</tr></table>")
 
 
 def source_html(result):
-    label, src = result["label"], result["source"]
-    head = (f"<h2 style='font-size:17px;margin:28px 0 4px;padding-top:18px;border-top:2px solid #e3e6eb;"
+    label = result["label"]
+    head = (f"<h2 style='font-size:16px;margin:26px 0 2px;padding-top:16px;border-top:2px solid #e3e6eb;"
             f"color:#1f2a37'>{esc(label)}</h2>")
     if result["first_run"]:
         return head + (f"<p style='font-size:13px;color:#5b6472'>No baseline existed for {esc(label)}; created "
                        f"<b>{esc(result['baseline_name'])}</b> with {result['count']:,} devices. Changes will be "
                        f"reported from the next run.</p>")
-    changes = result["changes"]
-    if not changes:
-        return head + f"<p style='font-size:13px;color:#5b6472'>No device plan changes.</p>"
-    out = head + tiles_row(changes)
-    for kind in ("added", "terminated", "changed"):
-        rows = [c for c in changes if c["kind"] == kind]
-        if rows:
-            out += table_html(src, rows, kind)
-    return out
+    if not result["changes"]:
+        return head + "<p style='font-size:13px;color:#5b6472'>No device plan changes.</p>"
+    n = counts(result["changes"])
+    return head + (f"<div style='font-size:12px;color:#5b6472'>{n['customers']} customer(s) affected</div>"
+                   + cards_row(result["changes"]))
 
 
 def digest_html(results, when):
     all_changes = [c for r in results for c in r["changes"]]
     labels = " &amp; ".join(esc(r["label"]) for r in results)
-    intro = (f"Device activations, terminations and plan changes since the previous run, "
-             f"for {labels}. Customer names open the Zoho CRM account; serial numbers open the "
-             f"device page where a link is configured. The full breakdown is attached as "
+    checked = any(c.get("crm_checked") for c in all_changes)
+    intro = (f"Device activations, terminations and plan changes since the previous run, for {labels}. "
+             f"Open the attached <b>report.html</b> for the clickable view: each card lists its device "
+             f"serials with <i>Copy</i> and <i>Download CSV</i>. The full breakdown is also in "
              f"<b>report.xlsx</b> (one sheet per source).")
+    crm_line = ("Terminated devices were checked against Zoho CRM cancellation requests; the red note "
+                "under a Terminated card counts devices with no matching request."
+                if checked else
+                "Cancellation requests were <b>not</b> checked this run (CRM token not configured or lookup failed).")
     return (f"<html><body style='margin:0;padding:0;background:#eef1f5'>"
             f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;background:#eef1f5'><tr><td align='center' style='padding:18px 8px'>"
-            f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;max-width:1100px;background:#fff;border-radius:10px;overflow:hidden;font-family:Segoe UI,Helvetica,Arial,sans-serif;color:#1f2a37'>"
+            f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;max-width:760px;background:#fff;border-radius:10px;overflow:hidden;font-family:Segoe UI,Helvetica,Arial,sans-serif;color:#1f2a37'>"
             f"<tr><td style='background:#{BRAND};padding:18px 24px'>"
             f"<div style='font-size:11px;letter-spacing:.12em;color:#c9d4e3;text-transform:uppercase'>Device Billing Update</div>"
             f"<div style='font-size:20px;font-weight:700;color:#fff;margin-top:4px'>{labels} &middot; Daily</div>"
             f"<div style='font-size:12px;color:#c9d4e3;margin-top:4px'>{esc(when)}</div></td></tr>"
             f"<tr><td style='padding:18px 24px 26px'>"
             f"<p style='font-size:13px;line-height:1.5;margin:0'>{intro}</p>"
-            f"{tiles_row(all_changes) if len(results) > 1 else ''}"
+            f"<p style='font-size:12px;line-height:1.5;margin:8px 0 0;color:#5b6472'>{crm_line}</p>"
+            f"{('<h2 style=font-size:16px;margin:22px_0_2px;color:#1f2a37>All sources</h2>'.replace('_', ' ') + cards_row(all_changes)) if len(results) > 1 else ''}"
             f"{''.join(source_html(r) for r in results)}"
             f"</td></tr></table></td></tr></table></body></html>")
 
@@ -818,38 +996,156 @@ def digest_text(results, when):
         lines.append(f"== {r['label']} ==")
         if r["first_run"]:
             lines.append(f"Baseline created with {r['count']} devices; nothing to compare yet.")
-        elif not r["changes"]:
-            lines.append("No device plan changes.")
+            continue
+        n = counts(r["changes"])
+        lines.append(f"Devices added: {n['added']}   Terminated: {n['terminated']} "
+                     f"({n['no_request']} without a cancellation request)   Plan changes: {n['changed']}")
         for kind in ("added", "terminated", "changed"):
             rows = [c for c in r["changes"] if c["kind"] == kind]
             if rows:
-                lines.append(f"-- {SECTION_TITLE[kind]} ({len(rows)})")
-                lines += [f"  {c['serial']}  ({c['customer'] or '-'})  {c['old_plan']} -> {c['new_plan']}"
-                          for c in rows]
+                lines.append(f"-- {CARD_LABELS[kind]} ({len(rows)})")
+                for c in rows:
+                    extra = f"  [{cancel_text(c)}]" if kind == "terminated" else ""
+                    lines.append(f"  {c['serial']}  ({c['customer'] or '-'})  {c['old_plan']} -> {c['new_plan']}{extra}")
         lines.append("")
-    lines.append("Full breakdown attached as report.xlsx.")
+    lines.append("Clickable view: report.html (attached). Full breakdown: report.xlsx (attached).")
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------ report.html
+
+def build_report_html(results, when):
+    """Self-contained interactive page: the same cards, clickable. Opens in any
+    browser from the attachment; no network needed."""
+    data = []
+    for r in results:
+        data.append({
+            "key": r["key"], "label": r["label"], "first_run": r["first_run"], "count": r["count"],
+            "columns": [lab for lab, _, _ in r["source"].get("columns", [])],
+            "changes": [{
+                "kind": c["kind"], "serial": c["serial"] if c.get("has_serial", True) else "",
+                "id": c["serial"], "customer": c["customer"], "crm_url": crm_link(c),
+                "device_url": device_link(c), "old_plan": c["old_plan"], "new_plan": c["new_plan"],
+                "fields": list(c["fields"].values()),
+                "crm_checked": bool(c.get("crm_checked")),
+                "cancellations": [{"ref": q["ref"], "ticket": q["ticket"], "status": q["status"],
+                                   "finance_status": q["finance_status"], "requested": q["requested"],
+                                   "url": q["url"], "ticket_url": q["ticket_url"]}
+                                  for q in (c.get("cancellations") or [])],
+            } for c in r["changes"]],
+        })
+    payload = json.dumps({"when": when, "brand": "#" + BRAND, "sources": data}).replace("</", "<\\/")
+    return REPORT_TEMPLATE.replace("__DATA__", payload)
+
+
+REPORT_TEMPLATE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Device billing changes</title>
+<style>
+:root{--brand:#1F3A5F;--ink:#1f2a37;--mute:#5b6472;--line:#e3e6eb;--bg:#eef1f5;--add:#1a7f4b;--term:#b3261e;--chg:#1a5fb4}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);font:14px/1.45 "Segoe UI",Helvetica,Arial,sans-serif;color:var(--ink)}
+.wrap{max-width:1180px;margin:18px auto;background:#fff;border-radius:10px;overflow:hidden}
+.head{background:var(--brand);color:#fff;padding:18px 24px}.head small{display:block;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#c9d4e3}
+.head b{font-size:20px}.head span{display:block;font-size:12px;color:#c9d4e3;margin-top:4px}
+.body{padding:18px 24px 28px}h2{font-size:16px;margin:24px 0 6px;padding-top:14px;border-top:2px solid var(--line)}h2.first{border:0;padding:0;margin-top:6px}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:10px 0}
+.card{background:#f4f6fa;border-radius:8px;border-bottom:3px solid #ccc;padding:16px 10px;text-align:center;cursor:pointer;transition:transform .08s,box-shadow .08s;border-top:1px solid transparent}
+.card:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.08)}.card.on{outline:2px solid var(--brand);outline-offset:2px}
+.card .n{font-size:30px;font-weight:700;line-height:1}.card .c{font-size:11px;color:var(--mute);text-transform:uppercase;letter-spacing:.04em;margin-top:6px}
+.card .w{font-size:11px;color:var(--term);margin-top:4px}
+.card.added{border-bottom-color:var(--add)}.card.added .n{color:var(--add)}
+.card.terminated{border-bottom-color:var(--term)}.card.terminated .n{color:var(--term)}
+.card.changed{border-bottom-color:var(--chg)}.card.changed .n{color:var(--chg)}
+.card.zero{opacity:.45;cursor:default}
+#panel{margin-top:18px;border:1px solid var(--line);border-radius:8px;overflow:hidden;display:none}
+#panel .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;background:#f8f9fb;border-bottom:1px solid var(--line)}
+#panel .bar h3{margin:0;font-size:15px;flex:1 1 auto}#panel .bar input{padding:6px 9px;border:1px solid #c9d0da;border-radius:6px;min-width:200px}
+button{border:0;border-radius:6px;padding:7px 12px;font-weight:600;cursor:pointer;background:var(--brand);color:#fff}button.alt{background:#e7ebf1;color:var(--ink)}button:active{transform:translateY(1px)}
+.tbl{overflow:auto;max-height:70vh}table{border-collapse:collapse;width:100%;min-width:780px}th{position:sticky;top:0;background:var(--brand);color:#fff;font-size:12px;text-align:left;padding:7px 9px;white-space:nowrap}
+td{padding:6px 9px;border-bottom:1px solid var(--line);font-size:12px;vertical-align:top}tr:nth-child(even) td{background:#f8f9fb}
+.mono{font-family:Consolas,Menlo,monospace}a{color:#1a5fb4;text-decoration:none}a:hover{text-decoration:underline}
+.bad{color:var(--term);font-weight:600}.ok{color:var(--add)}.mute{color:var(--mute)}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#1f2a37;color:#fff;padding:9px 14px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s}.toast.show{opacity:1}
+.foot{font-size:12px;color:var(--mute);margin-top:18px}
+</style></head><body><div class="wrap">
+<div class="head"><small>Device Billing Update</small><b id="title"></b><span id="when"></span></div>
+<div class="body">
+<p class="mute" style="margin:0 0 4px">Click a card to list its devices. <b>Copy serials</b> puts one serial per line on the clipboard; <b>Download CSV</b> saves the visible rows with every column.</p>
+<div id="sections"></div>
+<div id="panel"><div class="bar"><h3 id="ptitle"></h3><input id="q" placeholder="Filter (serial, customer, plan)…"><button id="copy">Copy serials</button><button id="copyall" class="alt">Copy all columns</button><button id="dl" class="alt">Download CSV</button></div><div class="tbl"><table><thead id="th"></thead><tbody id="tb"></tbody></table></div></div>
+<div class="foot">Customer names open the Zoho CRM account. Serial numbers open the device page where a link is configured. “Cancellation request” shows the matching Zoho CRM cancellation (ref · ticket · status); <span class="bad">No request found</span> means a device was terminated with no request on file in the look-back window.</div>
+</div></div><div class="toast" id="toast"></div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+const D=JSON.parse(document.getElementById('data').textContent);
+const KL={added:'Devices Added',terminated:'Terminated',changed:'Plan Changes'};
+const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+document.getElementById('title').textContent=D.sources.map(s=>s.label).join(' & ')+' · Daily';
+document.getElementById('when').textContent=D.when;document.documentElement.style.setProperty('--brand',D.brand);
+const all={key:'all',label:'All sources',changes:D.sources.flatMap(s=>s.changes.map(c=>({...c,_src:s.label,_cols:s.columns}))),columns:[],first_run:false};
+D.sources.forEach(s=>s.changes.forEach(c=>{c._src=s.label;c._cols=s.columns}));
+const groups=(D.sources.length>1?[all]:[]).concat(D.sources);
+function cnt(ch){const n={added:0,terminated:0,changed:0,nr:0};ch.forEach(c=>{n[c.kind]++;if(c.kind==='terminated'&&c.crm_checked&&!c.cancellations.length)n.nr++});return n}
+const sec=document.getElementById('sections');
+groups.forEach((g,gi)=>{const h=document.createElement('h2');if(gi===0)h.className='first';h.textContent=g.label;sec.appendChild(h);
+ if(g.first_run){const p=document.createElement('p');p.className='mute';p.textContent='Baseline created with '+g.count.toLocaleString()+' devices; nothing to compare yet.';sec.appendChild(p);return}
+ const n=cnt(g.changes);const row=document.createElement('div');row.className='cards';
+ ['added','terminated','changed'].forEach(k=>{const d=document.createElement('div');d.className='card '+k+(n[k]?'':' zero');
+  d.innerHTML='<div class="n">'+n[k]+'</div><div class="c">'+KL[k]+'</div>'+(k==='terminated'&&n.nr?'<div class="w">'+n.nr+' without a cancellation request</div>':'');
+  if(n[k])d.onclick=()=>show(g,k,d);row.appendChild(d)});sec.appendChild(row)});
+let cur=null;
+function cancelCell(c){if(!c.crm_checked)return'<span class="mute">not checked</span>';if(!c.cancellations.length)return'<span class="bad">No request found</span>';
+ return c.cancellations.map(q=>'<a href="'+esc(q.url)+'" target="_blank">'+esc(q.ref||'request')+'</a>'+(q.ticket?' · '+(q.ticket_url?'<a href="'+esc(q.ticket_url)+'" target="_blank">'+esc(q.ticket)+'</a>':esc(q.ticket)):'')+' · '+esc(q.status)+(q.finance_status?' / '+esc(q.finance_status):'')+(q.requested?' <span class="mute">(req '+esc(q.requested)+')</span>':'')).join('<br>')}
+function rowsFor(){const q=document.getElementById('q').value.trim().toLowerCase();return cur.rows.filter(c=>!q||JSON.stringify([c.serial,c.id,c.customer,c.old_plan,c.new_plan,c.fields,c._src]).toLowerCase().includes(q))}
+function show(g,k,el){document.querySelectorAll('.card.on').forEach(x=>x.classList.remove('on'));el.classList.add('on');
+ const multi=g.key==='all';const cols=multi?[]:g.columns;
+ cur={g,k,rows:g.changes.filter(c=>c.kind===k),cols,multi};document.getElementById('ptitle').textContent=g.label+' — '+KL[k]+' ('+cur.rows.length+')';
+ document.getElementById('q').value='';document.getElementById('panel').style.display='block';render();document.getElementById('panel').scrollIntoView({behavior:'smooth',block:'start'})}
+function render(){const rows=rowsFor();const k=cur.k;const head=(cur.multi?['Source']:[]).concat(['Serial','Customer',k==='changed'?'Plan (old → new)':k==='added'?'Device Plan':'Device Plan'],cur.cols,k==='terminated'?['Cancellation request']:[]);
+ document.getElementById('th').innerHTML='<tr>'+head.map(h=>'<th>'+esc(h)+'</th>').join('')+'</tr>';
+ document.getElementById('tb').innerHTML=rows.map(c=>{const plan=k==='changed'?esc(c.old_plan)+' → <b>'+esc(c.new_plan)+'</b>':k==='added'?'<b>'+esc(c.new_plan)+'</b>':'<span class="bad">'+esc(c.new_plan)+'</span> <span class="mute">(was '+esc(c.old_plan)+')</span>';
+  const ser=c.serial?(c.device_url?'<a href="'+esc(c.device_url)+'" target="_blank">'+esc(c.serial)+'</a>':esc(c.serial)):'<span class="mute">-</span>';
+  const cust=c.crm_url?'<a href="'+esc(c.crm_url)+'" target="_blank">'+esc(c.customer||'-')+'</a>':esc(c.customer||'-');
+  const f=cur.multi?[]:c.fields;return'<tr>'+(cur.multi?'<td>'+esc(c._src)+'</td>':'')+'<td class="mono">'+ser+'</td><td>'+cust+'</td><td>'+plan+'</td>'+f.map(v=>'<td>'+(esc(v)||'-')+'</td>').join('')+(k==='terminated'?'<td>'+cancelCell(c)+'</td>':'')+'</tr>'}).join('');
+ document.getElementById('ptitle').textContent=cur.g.label+' — '+KL[k]+' ('+rows.length+(rows.length!==cur.rows.length?' of '+cur.rows.length:'')+')'}
+document.getElementById('q').oninput=render;
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1600)}
+async function copyText(t){try{await navigator.clipboard.writeText(t)}catch(e){const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}}
+document.getElementById('copy').onclick=async()=>{const rows=rowsFor();const ser=rows.map(c=>c.serial||c.id).filter(Boolean);await copyText(ser.join('\n'));toast(ser.length+' serial(s) copied')};
+function csvRows(){const rows=rowsFor();const k=cur.k;const cols=cur.multi?[]:cur.cols;const head=['Source','Change','Serial','Device Id','Customer','CRM Link','Device Link','Old Plan','New Plan'].concat(cols,['Cancellation Request','Cancellation Link','Ticket Link']);
+ const body=rows.map(c=>{const q=c.cancellations[0];const ct=!c.crm_checked?'not checked':c.cancellations.length?c.cancellations.map(x=>(x.ref||x.url)+' '+x.ticket+' - '+x.status+(x.finance_status?' / '+x.finance_status:'')+(x.requested?' (req '+x.requested+')':'')).join('; '):'NO REQUEST FOUND';
+  return[c._src,KL[c.kind],c.serial,c.id,c.customer,c.crm_url,c.device_url,c.old_plan,c.new_plan].concat(cur.multi?[]:c.fields,[ct,q?q.url:'',q?q.ticket_url:''])});return[head].concat(body)}
+const q=v=>{v=String(v??'');return/[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v};
+document.getElementById('copyall').onclick=async()=>{const r=csvRows();await copyText(r.map(x=>x.join('\t')).join('\n'));toast((r.length-1)+' row(s) copied (tab-separated, paste into Excel)')};
+document.getElementById('dl').onclick=()=>{const r=csvRows();const blob=new Blob(['﻿'+r.map(x=>x.map(q).join(',')).join('\n')],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=(cur.g.key+'_'+cur.k+'_'+D.when.replace(/[^0-9]/g,'').slice(0,12)+'.csv');a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500)};
+</script></body></html>"""
 
 
 def email_results(results):
     """One email, a section per source in SOURCES order (Geotab, then Zenduit)."""
     when = time.strftime("%b %d, %Y %H:%M UTC", time.gmtime())
-    counts = [f"{sum(1 for c in r['changes'] if c['kind'] == 'added')} added, "
-              f"{sum(1 for c in r['changes'] if c['kind'] == 'terminated')} terminated, "
-              f"{sum(1 for c in r['changes'] if c['kind'] == 'changed')} plan changes"
-              for r in results if not r["first_run"]]
     created = [r["label"] for r in results if r["first_run"]]
     subject = "Device billing changes - " + " & ".join(r["label"] for r in results) + " (Daily)"
     if created:
         subject += f" - baseline created: {', '.join(created)}"
+    attachments = [("report.html", build_report_html(results, when))]
     xlsx = build_xlsx(results)
     if xlsx:
-        attachments = [("report.xlsx", xlsx)]
+        attachments.append(("report.xlsx", xlsx))
     else:
-        attachments = [(f"plan_changes_{r['key']}.csv", build_csv(r["source"], r["changes"]))
-                       for r in results if r["changes"]]
-    say("Email summary: " + "; ".join(f"{r['label']}: {c}" for r, c in
-                                       zip([r for r in results if not r["first_run"]], counts)))
+        attachments += [(f"plan_changes_{r['key']}.csv", build_csv(r["source"], r["changes"]))
+                        for r in results if r["changes"]]
+    for r in results:
+        if not r["first_run"]:
+            n = counts(r["changes"])
+            say(f"Email summary [{r['label']}]: {n['added']} added, {n['terminated']} terminated "
+                f"({n['no_request']} without request), {n['changed']} plan changes")
+    # keep a copy of the interactive report next to the CSVs (becomes a run artifact)
+    try:
+        with open(os.path.join(DISCREPANCY_DIR, f"report_{time.strftime('%Y%m%d_%H%M')}.html"),
+                  "w", encoding="utf-8") as fh:
+            fh.write(attachments[0][1])
+    except OSError:
+        pass
     send_mail(subject, digest_html(results, when), digest_text(results, when), attachments)
 
 
@@ -1016,6 +1312,7 @@ def run():
 
     token = analytics_token()
     results = [process_source(s, token, include_never) for s in sources]
+    annotate_cancellations(results)
 
     # ---- one email for everything, Geotab section first, Zenduit second ----
     # If this raises, the script exits and no baseline below is touched — which
@@ -1225,7 +1522,8 @@ class DriveSync:
                 self.log(f"Drive: '{name}' not in folder (will be created on push)")
                 continue
             self.c.download(it["id"], os.path.join(self.work_dir, name))
-            self.log(f"Drive: downloaded {name} ({int(it.get('size') or 0) / 1024 / 1024:.1f} MB)")
+            self.log(f"Drive: downloaded {name} ({int(it.get('size') or 0) / 1024 / 1024:.1f} MB, "
+                     f"last modified in Drive {it.get('modifiedTime', '?')[:16].replace('T', ' ')} UTC)")
         self._before = _snapshot(self.work_dir)
 
     def push(self, keep_backups=0, keep_report_prefixes=(), keep_reports=0, only=None):
@@ -1248,8 +1546,9 @@ class DriveSync:
         for name in sorted(changed):
             path = os.path.join(self.work_dir, name)
             if name in remote:
-                self.c.update_file(remote[name]["id"], path)
-                self.log(f"Drive: updated  {name}")
+                info = self.c.update_file(remote[name]["id"], path)
+                self.log(f"Drive: updated  {name} (now {os.path.getsize(path) / 1024 / 1024:.1f} MB, "
+                         f"Drive modifiedTime {str(info.get('modifiedTime', '?'))[:16].replace('T', ' ')} UTC)")
             else:
                 self.c.create_file(self.folder_id, name, path)
                 self.log(f"Drive: uploaded {name}")
@@ -1503,11 +1802,44 @@ def cmd_check_token():
 
 
 
+def cmd_zoho_token():
+    """python main.py zoho-token <grant code>  -> prints a Zoho refresh token.
+
+    Make the grant code at https://api-console.zoho.com : open the client used
+    for Analytics (or create a "Self Client"), tab "Generate Code", scope
+        ZohoCRM.modules.READ,ZohoCRM.coql.READ
+    duration 10 minutes, then run this within those 10 minutes."""
+    code = sys.argv[2] if len(sys.argv) > 2 else input("Grant code from api-console.zoho.com: ").strip()
+    cid = ask("ZOHO_CLIENT_ID_CRM", "Zoho client id: ") if not CRM_ID else CRM_ID
+    sec = ask("ZOHO_CLIENT_SECRET_CRM", "Zoho client secret: ") if not CRM_SECRET else CRM_SECRET
+    r = requests.post("https://accounts.zoho.com/oauth/v2/token", data={
+        "grant_type": "authorization_code", "client_id": cid, "client_secret": sec, "code": code}, timeout=60)
+    body = r.json()
+    if r.status_code >= 400 or "refresh_token" not in body:
+        sys.exit(f"Token exchange failed: {r.status_code} {body}\n"
+                 "Grant codes expire quickly - generate a fresh one and retry at once.")
+    print("\nAdd this GitHub secret:\n")
+    print(f"  ZOHO_CLIENT_REFRESH_TOKEN_CRM = {body['refresh_token']}")
+    print("\n(scope granted: " + body.get("scope", "?") + ")")
+    # sanity check
+    try:
+        at = body["access_token"]
+        t = requests.post(f"{CRM_API}/coql", headers={"Authorization": f"Zoho-oauthtoken {at}"},
+                          json={"select_query": "select Cancellation_ID from Cancellations order by id desc limit 1"},
+                          timeout=60)
+        print("CRM check:", "OK - can read Cancellations" if t.status_code in (200, 204)
+              else f"FAILED {t.status_code} {t.text[:200]}")
+    except Exception as exc:
+        print("CRM check failed:", exc)
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd in ("get-token", "get_token"):
         cmd_get_token()
     elif cmd in ("check-token", "check_token"):
         cmd_check_token()
+    elif cmd in ("zoho-token", "zoho_token"):
+        cmd_zoho_token()
     else:
         main()
