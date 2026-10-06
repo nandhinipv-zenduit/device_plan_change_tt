@@ -938,19 +938,21 @@ CARD_LABELS = {"added": "Devices Added", "terminated": "Terminated", "changed": 
 
 
 def card_html(number, caption, color, note=""):
-    return (f"<td style='padding:0 6px;width:33%'><table role='presentation' cellpadding='0' cellspacing='0' "
-            f"style='width:100%;background:#f4f6fa;border-radius:8px;border-bottom:3px solid {color}'>"
-            f"<tr><td style='padding:16px 10px;text-align:center'>"
-            f"<div style='font-size:30px;font-weight:700;color:{color};line-height:1'>{number}</div>"
-            f"<div style='font-size:11px;color:#5b6472;text-transform:uppercase;letter-spacing:.04em;margin-top:6px'>{caption}</div>"
-            f"{f'<div style=font-size:11px;color:#b3261e;margin-top:4px>{note}</div>' if note else ''}"
+    # Fixed-width cards (not a % of the email), so a wide device table below
+    # cannot stretch them off-screen in Gmail / Zoho Desk.
+    return (f"<td style='padding:0 10px 0 0;vertical-align:top'><table role='presentation' cellpadding='0' cellspacing='0' "
+            f"style='width:190px;background:#f4f6fa;border-radius:8px;border-bottom:3px solid {color}'>"
+            f"<tr><td style='padding:12px 10px;text-align:center'>"
+            f"<div style='font-size:24px;font-weight:700;color:{color};line-height:1'>{number}</div>"
+            f"<div style='font-size:10px;color:#5b6472;text-transform:uppercase;letter-spacing:.04em;margin-top:5px;white-space:nowrap'>{caption}</div>"
+            f"{f'<div style=font-size:10px;color:#b3261e;margin-top:3px;white-space:nowrap>{note}</div>' if note else ''}"
             f"</td></tr></table></td>")
 
 
 def cards_row(changes):
     n = counts(changes)
-    note = f"{n['no_request']} without a cancellation request" if n["no_request"] else ""
-    return ("<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;margin:12px 0 4px'><tr>"
+    note = f"{n['no_request']} without request" if n["no_request"] else ""
+    return ("<table role='presentation' cellpadding='0' cellspacing='0' style='margin:10px 0 4px'><tr>"
             + card_html(n["added"], CARD_LABELS["added"], CARD_COLORS["added"])
             + card_html(n["terminated"], CARD_LABELS["terminated"], CARD_COLORS["terminated"], note)
             + card_html(n["changed"], CARD_LABELS["changed"], CARD_COLORS["changed"])
@@ -999,7 +1001,7 @@ def change_table_html(source, changes):
     more = (f"<p style='font-size:12px;color:#5b6472;margin:6px 0 0'>&hellip; and {len(changes) - ROW_CAP} more "
             f"in the attached report.xlsx.</p>" if len(changes) > ROW_CAP else "")
     return (f"<div style='overflow-x:auto;margin-top:10px'><table cellpadding='0' cellspacing='0' "
-            f"style='border-collapse:collapse;width:100%;min-width:900px'>"
+            f"style='border-collapse:collapse'>"
             f"<tr>{head}</tr>{''.join(rows)}</table></div>{more}")
 
 
@@ -1037,7 +1039,7 @@ def digest_html(results, when):
                    + cards_row(all_changes))
     return (f"<html><body style='margin:0;padding:0;background:#eef1f5'>"
             f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;background:#eef1f5'><tr><td align='center' style='padding:18px 8px'>"
-            f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;max-width:1200px;background:#fff;border-radius:10px;overflow:hidden;font-family:Segoe UI,Helvetica,Arial,sans-serif;color:#1f2a37'>"
+            f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;max-width:1100px;background:#fff;border-radius:10px;font-family:Segoe UI,Helvetica,Arial,sans-serif;color:#1f2a37'>"
             f"<tr><td style='background:#{BRAND};padding:18px 24px'>"
             f"<div style='font-size:11px;letter-spacing:.12em;color:#c9d4e3;text-transform:uppercase'>Device Billing Update</div>"
             f"<div style='font-size:20px;font-weight:700;color:#fff;margin-top:4px'>{labels} &middot; Daily</div>"
