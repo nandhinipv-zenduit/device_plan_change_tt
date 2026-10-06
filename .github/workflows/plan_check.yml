@@ -79,6 +79,12 @@ jobs:
           ZOHO_CLIENT_ID_ANALYTICS: ${{ secrets.ZOHO_CLIENT_ID_ANALYTICS }}
           ZOHO_CLIENT_SECRET_ANALYTICS: ${{ secrets.ZOHO_CLIENT_SECRET_ANALYTICS }}
           ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS: ${{ secrets.ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS }}
+          # ---- Zoho CRM: cancellation requests for terminated devices ----
+          # Same client as Analytics; a refresh token with CRM read scopes made by
+          #   python main.py zoho-token <grant code>
+          # Leave the secret empty to skip the check (the email then says so).
+          ZOHO_CLIENT_REFRESH_TOKEN_CRM: ${{ secrets.ZOHO_CLIENT_REFRESH_TOKEN_CRM }}
+          CRM_LOOKBACK_DAYS: "180"   # how far back to look for cancellation requests
           # ---- Email: sent through the Gmail API with the same Google token ----
           # (Gmail refuses SMTP logins from GitHub's runners, so SMTP is only a
           #  fallback here; SMTP_USERNAME/SMTP_PASSWORD may be left unset.)
@@ -104,6 +110,7 @@ jobs:
           name: plan-check-${{ github.run_id }}
           path: |
             work/plan_changes_*.csv
+            work/report_*.html
             work/compare_plans.log
           if-no-files-found: ignore
           retention-days: 90
