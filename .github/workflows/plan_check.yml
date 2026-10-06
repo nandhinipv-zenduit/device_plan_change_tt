@@ -1,0 +1,97 @@
+name: Device plan check
+
+on:
+  schedule:
+    # 06:00 IST every day = 00:30 UTC. GitHub cron is always UTC.
+    # Scheduled runs can start up to ~15-30 min late when GitHub is busy.
+    - cron: "30 0 * * *"
+  workflow_dispatch:
+    inputs:
+      include_never_activated:
+        description: "Also list devices that have no plan on either side"
+        type: boolean
+        default: false
+      no_update_baseline:
+        description: "Dry run: compare and email, but leave the baselines in Drive unchanged"
+        type: boolean
+        default: false
+      only:
+        description: "Run a single source (geotab or zenduit); blank = both"
+        type: string
+        default: ""
+
+# Never let two runs overlap: both would download the same baseline and the
+# second would upload a baseline the first had already replaced.
+concurrency:
+  group: plan-check
+  cancel-in-progress: false
+
+permissions:
+  contents: read           # the repo holds only code; all data lives in Google Drive
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45    # the Analytics export itself may wait up to 15 min per view
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests python-dotenv
+
+      - name: Build command-line flags
+        id: flags
+        run: |
+          FLAGS=""
+          if [ "${{ inputs.include_never_activated }}" = "true" ]; then FLAGS="$FLAGS --include-never-activated"; fi
+          if [ "${{ inputs.no_update_baseline }}" = "true" ]; then FLAGS="$FLAGS --no-update-baseline"; fi
+          if [ -n "${{ inputs.only }}" ]; then FLAGS="$FLAGS --only ${{ inputs.only }}"; fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Compare plans, email changes, write results back to Google Drive
+        env:
+          # ---- Where the files live ----
+          STORAGE: gdrive
+          WORK_DIR: ${{ github.workspace }}/work
+          GDRIVE_SYNC_EXTRAS: "0"   # Drive gets ONLY the two baseline tables; nothing else is written there
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          # ---- Zoho Analytics ----
+          ZOHO_ORG_ID: ${{ secrets.ZOHO_ORG_ID }}
+          ZOHO_CLIENT_ID_ANALYTICS: ${{ secrets.ZOHO_CLIENT_ID_ANALYTICS }}
+          ZOHO_CLIENT_SECRET_ANALYTICS: ${{ secrets.ZOHO_CLIENT_SECRET_ANALYTICS }}
+          ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS: ${{ secrets.ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS }}
+          # ---- Email ----
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "587"
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.SMTP_USERNAME }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          # ---- Housekeeping ----
+          KEEP_BACKUPS: "0"         # no backup copies: Drive keeps the baseline's own version history
+          KEEP_REPORTS: "200"
+        run: python main.py ${{ steps.flags.outputs.flags }}
+
+      # The reports and the log are NOT written to Drive. They are attached to
+      # this run instead: Actions -> the run -> Artifacts, kept for 90 days.
+      # (The email carries the same report as an attachment anyway.)
+      - name: Attach report and log to the workflow run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-check-${{ github.run_id }}
+          path: |
+            work/plan_changes_*.csv
+            work/compare_plans.log
+          if-no-files-found: ignore
+          retention-days: 90
