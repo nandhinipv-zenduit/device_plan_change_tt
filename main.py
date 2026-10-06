@@ -77,6 +77,7 @@ WHAT A RUN DOES, IN ORDER
 .env (next to this script) or environment:
     ZOHO_ORG_ID, ZOHO_CLIENT_ID_ANALYTICS, ZOHO_CLIENT_SECRET_ANALYTICS,
     ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS,
+    ZOHO_CLIENT_ID_CRM, ZOHO_CLIENT_SECRET_CRM, ZOHO_CLIENT_REFRESH_TOKEN_CRM
     EMAIL_FROM, EMAIL_TO, MAIL_VIA (gmail_api | smtp)
     SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD   (smtp mode only)
     STORAGE (local | gdrive), DISCREPANCY_DIR (local mode), WORK_DIR (gdrive mode)
@@ -273,10 +274,12 @@ ORG_ID = env("ZOHO_ORG_ID", "67409019")
 A_ID = env("ZOHO_CLIENT_ID_ANALYTICS")
 A_SECRET = env("ZOHO_CLIENT_SECRET_ANALYTICS")
 A_REFRESH = env("ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS")
-# CRM token: same client as Analytics unless a separate one is given.
-CRM_ID = env("ZOHO_CLIENT_ID_CRM", A_ID)
-CRM_SECRET = env("ZOHO_CLIENT_SECRET_CRM", A_SECRET)
+# Zoho CRM uses its OWN OAuth client and refresh token (separate from Analytics).
+# All three must be set for the cancellation-request lookup to run.
+CRM_ID = env("ZOHO_CLIENT_ID_CRM")
+CRM_SECRET = env("ZOHO_CLIENT_SECRET_CRM")
 CRM_REFRESH = env("ZOHO_CLIENT_REFRESH_TOKEN_CRM")
+CRM_CONFIGURED = bool(CRM_ID and CRM_SECRET and CRM_REFRESH)
 
 SMTP_HOST = env("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(env("SMTP_PORT", "587"))
@@ -604,7 +607,7 @@ def serial_keys(text):
 
 
 def crm_token():
-    if not (CRM_ID and CRM_SECRET and CRM_REFRESH):
+    if not CRM_CONFIGURED:
         return ""
     r = requests.post("https://accounts.zoho.com/oauth/v2/token", data={
         "grant_type": "refresh_token", "client_id": CRM_ID,
@@ -711,8 +714,10 @@ def annotate_cancellations(results):
     changes = [c for r in results for c in r["changes"]]
     if not changes:
         return
-    if not CRM_REFRESH:
-        say("CRM: ZOHO_CLIENT_REFRESH_TOKEN_CRM not set - cancellation requests not checked")
+    if not CRM_CONFIGURED:
+        missing = [n for n, v in (("ZOHO_CLIENT_ID_CRM", CRM_ID), ("ZOHO_CLIENT_SECRET_CRM", CRM_SECRET),
+                                  ("ZOHO_CLIENT_REFRESH_TOKEN_CRM", CRM_REFRESH)) if not v]
+        say(f"CRM: {', '.join(missing)} not set - cancellation requests not checked")
         for c in changes:
             c["cancellations"], c["crm_checked"] = [], False
         return
@@ -1743,20 +1748,23 @@ def cmd_check_token():
 def cmd_zoho_token():
     """python main.py zoho-token <grant code>  -> prints a Zoho refresh token.
 
-    Make the grant code at https://api-console.zoho.com : open the client used
-    for Analytics (or create a "Self Client"), tab "Generate Code", scope
+    Uses the CRM OAuth client (ZOHO_CLIENT_ID_CRM / ZOHO_CLIENT_SECRET_CRM, or
+    typed in when asked). Make the grant code at https://api-console.zoho.com :
+    open that client, tab "Generate Code", scope
         ZohoCRM.modules.READ,ZohoCRM.coql.READ
     duration 10 minutes, then run this within those 10 minutes."""
     code = sys.argv[2] if len(sys.argv) > 2 else input("Grant code from api-console.zoho.com: ").strip()
-    cid = ask("ZOHO_CLIENT_ID_CRM", "Zoho client id: ") if not CRM_ID else CRM_ID
-    sec = ask("ZOHO_CLIENT_SECRET_CRM", "Zoho client secret: ") if not CRM_SECRET else CRM_SECRET
+    cid = ask("ZOHO_CLIENT_ID_CRM", "Zoho CRM client id: ")
+    sec = ask("ZOHO_CLIENT_SECRET_CRM", "Zoho CRM client secret: ")
     r = requests.post("https://accounts.zoho.com/oauth/v2/token", data={
         "grant_type": "authorization_code", "client_id": cid, "client_secret": sec, "code": code}, timeout=60)
     body = r.json()
     if r.status_code >= 400 or "refresh_token" not in body:
         sys.exit(f"Token exchange failed: {r.status_code} {body}\n"
                  "Grant codes expire quickly - generate a fresh one and retry at once.")
-    print("\nAdd this GitHub secret:\n")
+    print("\nAdd these three GitHub secrets:\n")
+    print(f"  ZOHO_CLIENT_ID_CRM            = {cid}")
+    print(f"  ZOHO_CLIENT_SECRET_CRM        = {sec}")
     print(f"  ZOHO_CLIENT_REFRESH_TOKEN_CRM = {body['refresh_token']}")
     print("\n(scope granted: " + body.get("scope", "?") + ")")
     # sanity check
