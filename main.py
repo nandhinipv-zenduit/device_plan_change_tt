@@ -637,6 +637,84 @@ def crm_coql_all(token, select_cols, module, where):
         last_id = page[-1]["id"]
 
 
+class CoqlNotAllowed(RuntimeError):
+    pass
+
+
+def crm_coql_or_raise(token, select_cols, module, where):
+    try:
+        return crm_coql_all(token, select_cols, module, where)
+    except RuntimeError as exc:
+        if "OAUTH_SCOPE_MISMATCH" in str(exc) or "invalid oauth scope" in str(exc):
+            raise CoqlNotAllowed(str(exc))
+        raise
+
+
+def crm_records_modified_since(token, module, fields, since_iso):
+    """Records API fallback (needs only ZohoCRM.modules.READ): every record of
+    `module` modified since `since_iso`, paged. Subform fields are NOT returned
+    by the list call, so callers fetch each record for those."""
+    rows, page, page_token = [], 1, None
+    head = {"Authorization": f"Zoho-oauthtoken {token}", "If-Modified-Since": since_iso}
+    while True:
+        params = {"fields": fields, "per_page": 200, "sort_by": "Modified_Time", "sort_order": "desc"}
+        if page_token:
+            params["page_token"] = page_token
+        else:
+            params["page"] = page
+        r = requests.get(f"{CRM_API}/{module}", headers=head, params=params, timeout=(30, 120))
+        if r.status_code == 204 or r.status_code == 304:
+            return rows
+        if r.status_code >= 400:
+            raise RuntimeError(f"CRM records list failed ({module}): {r.status_code} {r.text[:300]}")
+        body = r.json()
+        rows.extend(body.get("data") or [])
+        info = body.get("info") or {}
+        if not info.get("more_records"):
+            return rows
+        page_token = info.get("next_page_token")
+        page += 1
+        if not page_token and page > 10:         # records API caps plain paging at 2000
+            return rows
+
+
+def crm_record(token, module, rid):
+    r = requests.get(f"{CRM_API}/{module}/{rid}",
+                     headers={"Authorization": f"Zoho-oauthtoken {token}"}, timeout=(30, 120))
+    if r.status_code >= 400:
+        raise RuntimeError(f"CRM get {module}/{rid} failed: {r.status_code} {r.text[:200]}")
+    data = r.json().get("data") or []
+    return data[0] if data else {}
+
+
+HEAD_FIELDS = ("Name, Cancellation_ID, Account_Name, Churn, Cancellation_Status, Finance_Cancellation_Status, "
+               "Cancellation_Request_Date, Finance_Cancellation_Status_Timestamp, Ticket_URL, Platform_Affected, "
+               "Serial_Numbers, Cancellation_Details_Notes, Additional_Notes")
+
+
+def fetch_cancellations(token, since):
+    """(heads, items) via COQL when the token allows it, else via the records API."""
+    try:
+        heads = crm_coql_or_raise(token, HEAD_FIELDS, "Cancellations", f"Modified_Time >= '{since}'")
+        items = crm_coql_or_raise(token, "Parent_Id, Serial_Numbers, Vendor_Plan, Qty",
+                                  "Subform_2", f"Modified_Time >= '{since}'")
+        say("CRM: fetched via COQL")
+        return heads, items
+    except CoqlNotAllowed:
+        say("CRM: token has no ZohoCRM.coql.READ scope - using the records API instead "
+            "(slower: one call per cancellation request)")
+    heads = crm_records_modified_since(token, "Cancellations", HEAD_FIELDS.replace(" ", ""), since)
+    items = []
+    for i, h in enumerate(heads, 1):
+        full = crm_record(token, "Cancellations", h["id"])
+        for row in full.get("Subform_2") or []:
+            items.append({"Parent_Id": {"id": h["id"]}, "Serial_Numbers": row.get("Serial_Numbers"),
+                          "Vendor_Plan": row.get("Vendor_Plan"), "Qty": row.get("Qty")})
+        if i % 50 == 0:
+            say(f"CRM: fetched {i}/{len(heads)} cancellation records")
+    return heads, items
+
+
 def load_cancellations():
     """Cancellation requests touched in the last CRM_LOOKBACK_DAYS days.
 
@@ -649,13 +727,7 @@ def load_cancellations():
     token = crm_token()
     since = (datetime.datetime.now(datetime.timezone.utc)
              - datetime.timedelta(days=CRM_LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    heads = crm_coql_all(token,
-        "Name, Cancellation_ID, Account_Name, Churn, Cancellation_Status, Finance_Cancellation_Status, "
-        "Cancellation_Request_Date, Finance_Cancellation_Status_Timestamp, Ticket_URL, Platform_Affected, "
-        "Serial_Numbers, Cancellation_Details_Notes, Additional_Notes",
-        "Cancellations", f"Modified_Time >= '{since}'")
-    items = crm_coql_all(token, "Parent_Id, Serial_Numbers, Vendor_Plan, Qty",
-                         "Subform_2", f"Modified_Time >= '{since}'")
+    heads, items = fetch_cancellations(token, since)
 
     requests_by_id, blobs, index = {}, {}, collections.defaultdict(list)
     for h in heads:
@@ -1753,7 +1825,8 @@ def cmd_zoho_token():
     Uses the CRM OAuth client (ZOHO_CLIENT_ID_CRM / ZOHO_CLIENT_SECRET_CRM, or
     typed in when asked). Make the grant code at https://api-console.zoho.com :
     open that client, tab "Generate Code", scope
-        ZohoCRM.modules.READ,ZohoCRM.coql.READ
+        ZohoCRM.modules.READ,ZohoCRM.coql.READ   (coql is optional: without it the
+        records API is used, which is slower but works)
     duration 10 minutes, then run this within those 10 minutes."""
     code = sys.argv[2] if len(sys.argv) > 2 else input("Grant code from api-console.zoho.com: ").strip()
     cid = ask("ZOHO_CLIENT_ID_CRM", "Zoho CRM client id: ")
