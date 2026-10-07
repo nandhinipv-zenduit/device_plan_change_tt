@@ -2,9 +2,12 @@ name: Device plan check
 
 on:
   schedule:
-    # 06:00 IST every day = 00:30 UTC. GitHub cron is always UTC.
-    # Scheduled runs can start up to ~15-30 min late when GitHub is busy.
-    - cron: "30 0 * * *"
+    # 13:23 IST every day = 07:53 UTC. GitHub cron is always UTC.
+    # Deliberately NOT on :00 or :30 - those minutes are so busy on GitHub that
+    # scheduled runs there are often delayed by 30+ min or dropped altogether
+    # (which is what happened on the first morning). Odd minutes fire reliably,
+    # so this lands a few minutes before the 1:30 PM IST target.
+    - cron: "53 7 * * *"
   workflow_dispatch:
     inputs:
       include_never_activated:
