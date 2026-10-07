@@ -199,7 +199,9 @@ CRM_CANCELLATION_URL = env("CRM_CANCELLATION_URL",
 #   terminated_plans  plan values that mean the device was terminated
 #   device_url     link template for the serial (see above)
 #   url_fields     placeholder name -> column, for the device_url template
-#   columns        extra columns shown in the email/xlsx: (label, [cols], kind)
+#   columns        extra columns: (label, [cols], kind, in_email). All of them go
+#                  to report.xlsx; only those with in_email=True appear in the
+#                  email body, to keep the table narrow enough to read.
 #                  kind: "text" | "date" | "datamb" (megabytes -> GB/MB)
 #
 # If none of the exact names exist, find_col falls back to a fuzzy match
@@ -223,13 +225,14 @@ SOURCES = [
         "url_fields": {"device_id": "device_id", "database": "OwnerDatabaseName",
                        "account": "account_accountId"},
         "columns": [
-            ("Reseller Acct", ["account_accountId"], "text"),
-            ("Device Type", ["device_deviceType_name"], "text"),
-            ("Database", ["OwnerDatabaseName", "latestDeviceDatabase_databaseName"], "text"),
-            ("Billing Plan", ["Active Billing Plan"], "text"),
-            ("Billing Status", ["Billing Status"], "text"),
-            ("Last Communicate", ["latestDeviceDatabase_statusDate"], "date"),
-            ("Date Added", ["startDate", "firstDeviceActivationDate"], "date"),
+            # (label, candidate columns, kind, shown in the email body?)  All go to report.xlsx.
+            ("Reseller Acct", ["account_accountId"], "text", False),
+            ("Device Type", ["device_deviceType_name"], "text", True),
+            ("Database", ["OwnerDatabaseName", "latestDeviceDatabase_databaseName"], "text", True),
+            ("Billing Plan", ["Active Billing Plan"], "text", False),
+            ("Billing Status", ["Billing Status"], "text", False),
+            ("Last Communicate", ["latestDeviceDatabase_statusDate"], "date", True),
+            ("Date Added", ["startDate", "firstDeviceActivationDate"], "date", False),
         ],
     },
     {
@@ -259,13 +262,13 @@ SOURCES = [
         "url_fields": {"device_id": "Device_Id", "company_id": "CompanyId",
                        "account": "AccountId"},
         "columns": [
-            ("Reseller", ["Reseller_Name"], "text"),
-            ("Tracker Type", ["Tracker_type"], "text"),
-            ("Device Name", ["Device_Name"], "text"),
-            ("Data Plan", ["Data_Plan"], "datamb"),
-            ("Billing Plan", ["Billing_Plan"], "text"),
-            ("Last Communicate", ["Last_active"], "date"),
-            ("Date Added", ["CreationDate", "Activation_Date"], "date"),
+            ("Reseller", ["Reseller_Name"], "text", True),
+            ("Tracker Type", ["Tracker_type"], "text", True),
+            ("Device Name", ["Device_Name"], "text", True),
+            ("Data Plan", ["Data_Plan"], "datamb", False),
+            ("Billing Plan", ["Billing_Plan"], "text", False),
+            ("Last Communicate", ["Last_active"], "date", True),
+            ("Date Added", ["CreationDate", "Activation_Date"], "date", False),
         ],
     },
 ]
@@ -361,7 +364,7 @@ def to_plan_map(text, source, label):
              or find_col(cols, [], ["company"], "customer", required=False))
     crm_col = next((c for c in source.get("crm_id_cols", []) if c in cols), "")
     extra = [(lab, next((c for c in cands if c in cols), ""), kind)
-             for lab, cands, kind in source.get("columns", [])]
+             for lab, cands, kind, *_ in source.get("columns", [])]
     url_fields = {k: v for k, v in source.get("url_fields", {}).items() if v in cols}
     alt_cols = [c for c in source.get("alt_id_cols", []) if c in cols]
     blank_plans = source.get("blank_plans") or {""}
@@ -613,7 +616,11 @@ def crm_token():
         "grant_type": "refresh_token", "client_id": CRM_ID,
         "client_secret": CRM_SECRET, "refresh_token": CRM_REFRESH}, timeout=60)
     if r.status_code >= 400 or not r.json().get("access_token"):
-        raise RuntimeError(f"CRM token refresh failed: {r.status_code} {r.text[:200]}")
+        raise RuntimeError(
+            f"CRM token refresh failed: {r.status_code} {r.text[:200]} "
+            f"[secret shape: refresh token {len(CRM_REFRESH)} chars / {CRM_REFRESH.count('.')} dots, "
+            f"starts '{CRM_REFRESH[:6]}'; client id {len(CRM_ID)} chars, starts '{CRM_ID[:6]}'; "
+            f"secret {len(CRM_SECRET)} chars] - compare with check_zoho_crm_token.py on your PC")
     return r.json()["access_token"]
 
 
@@ -834,7 +841,7 @@ def _row_values(c):
 
 def _row_headers(source):
     return (["Change", "Customer", "CRM Link", "Serial", "Device Link", "Old Plan", "New Plan"]
-            + [lab for lab, _, _ in source.get("columns", [])]
+            + [lab for lab, *_ in source.get("columns", [])]
             + ["Cancellation Request", "Cancellation Link", "Ticket Link"])
 
 
@@ -1010,39 +1017,48 @@ CARD_LABELS = {"added": "Devices Added", "terminated": "Terminated", "changed": 
 
 
 def card_html(number, caption, color, note=""):
-    # Fixed-width cards (not a % of the email), so a wide device table below
-    # cannot stretch them off-screen in Gmail / Zoho Desk.
-    return (f"<td style='padding:0 10px 0 0;vertical-align:top'><table role='presentation' cellpadding='0' cellspacing='0' "
-            f"style='width:190px;background:#f4f6fa;border-radius:8px;border-bottom:3px solid {color}'>"
-            f"<tr><td style='padding:12px 10px;text-align:center'>"
-            f"<div style='font-size:24px;font-weight:700;color:{color};line-height:1'>{number}</div>"
-            f"<div style='font-size:10px;color:#5b6472;text-transform:uppercase;letter-spacing:.04em;margin-top:5px;white-space:nowrap'>{caption}</div>"
-            f"{f'<div style=font-size:10px;color:#b3261e;margin-top:3px;white-space:nowrap>{note}</div>' if note else ''}"
+    # Fixed-width cards with HTML width attributes (Gmail/Desk honour those more
+    # reliably than CSS widths), so the device table below cannot stretch them.
+    return (f"<td width='200' style='width:200px;padding:0 12px 0 0;vertical-align:top'>"
+            f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' border='0' "
+            f"style='width:100%;background:#f4f6fa;border-radius:8px;border-bottom:3px solid {color}'>"
+            f"<tr><td align='center' style='padding:14px 8px 12px;text-align:center'>"
+            f"<div style='font-size:26px;font-weight:700;color:{color};line-height:1;font-family:Segoe UI,Helvetica,Arial,sans-serif'>{number}</div>"
+            f"<div style='font-size:10px;color:#5b6472;text-transform:uppercase;letter-spacing:.06em;margin-top:6px;white-space:nowrap;font-family:Segoe UI,Helvetica,Arial,sans-serif'>{caption}</div>"
+            f"<div style='font-size:10px;color:#b3261e;margin-top:4px;white-space:nowrap;min-height:12px'>{note or '&nbsp;'}</div>"
             f"</td></tr></table></td>")
 
 
 def cards_row(changes):
     n = counts(changes)
     note = f"{n['no_request']} without request" if n["no_request"] else ""
-    return ("<table role='presentation' cellpadding='0' cellspacing='0' style='margin:10px 0 4px'><tr>"
+    return ("<table role='presentation' width='636' cellpadding='0' cellspacing='0' border='0' "
+            "style='width:636px;margin:12px 0 6px'><tr>"
             + card_html(n["added"], CARD_LABELS["added"], CARD_COLORS["added"])
             + card_html(n["terminated"], CARD_LABELS["terminated"], CARD_COLORS["terminated"], note)
             + card_html(n["changed"], CARD_LABELS["changed"], CARD_COLORS["changed"])
             + "</tr></table>")
 
 
+EMAIL_WIDTH = int(env("EMAIL_WIDTH", "1000"))     # px; header, cards and tables share this width
+
+
 def change_table_html(source, changes):
-    """ONE table per source: every changed device, with a Change column."""
-    th = (f"padding:7px 9px;background:#{BRAND};color:#fff;font-size:12px;text-align:left;"
-          "white-space:nowrap;border-right:1px solid rgba(255,255,255,.15)")
-    td = "padding:6px 9px;border-bottom:1px solid #e3e6eb;font-size:12px;vertical-align:top"
-    extra = [lab for lab, _, _ in source.get("columns", [])]
-    crm_checked = any(c.get("crm_checked") for c in changes)
-    headers = ["Change", "Customer", "Serial", "Plan (old &rarr; new)"] + extra + ["Cancellation Request"]
+    """ONE table per source: every changed device, with a Change column. Only
+    the columns flagged in_email are shown; report.xlsx has all of them."""
+    th = (f"padding:8px 9px;background:#{BRAND};color:#fff;font-size:11px;text-align:left;"
+          "white-space:nowrap;text-transform:uppercase;letter-spacing:.04em;"
+          "font-family:Segoe UI,Helvetica,Arial,sans-serif")
+    td = ("padding:7px 9px;border-bottom:1px solid #e3e6eb;font-size:12px;vertical-align:top;"
+          "font-family:Segoe UI,Helvetica,Arial,sans-serif;line-height:1.35")
+    extra = [(lab, i) for i, (lab, *rest) in enumerate(source.get("columns", []))
+             if len(rest) < 3 or rest[2]]
+    headers = ["Change", "Customer", "Serial", "Plan (old &rarr; new)"] + [lab for lab, _ in extra] \
+              + ["Cancellation Request"]
     head = "".join(f"<th style='{th}'>{h}</th>" for h in headers)
     rows = []
     for i, c in enumerate(changes[:ROW_CAP]):
-        bg = "#ffffff" if i % 2 == 0 else "#f8f9fb"
+        bg = "#ffffff" if i % 2 == 0 else "#f7f8fa"
         color = CARD_COLORS[c["kind"]]
         kind = f"<span style='color:{color};font-weight:600;white-space:nowrap'>{KIND_LABEL[c['kind']]}</span>"
         if c["kind"] == "added":
@@ -1052,7 +1068,7 @@ def change_table_html(source, changes):
         else:
             plan = f"{esc(c['old_plan'])} &rarr; <b>{esc(c['new_plan'])}</b>"
         if c["kind"] != "terminated":
-            canc = "<span style='color:#8a94a3'>-</span>"
+            canc = "<span style='color:#b0b7c3'>&ndash;</span>"
         elif not c.get("crm_checked"):
             canc = "<span style='color:#8a94a3'>not checked</span>"
         elif not c.get("cancellations"):
@@ -1065,22 +1081,23 @@ def change_table_html(source, changes):
                 + (f" / {esc(q['finance_status'])}" if q["finance_status"] else "")
                 + (f" <span style='color:#8a94a3'>(req {esc(q['requested'])})</span>" if q["requested"] else "")
                 for q in c["cancellations"])
+        values = list(c["fields"].values())
         cells = [kind, a(c["customer"], crm_link(c)),
                  f"<span style='font-family:Consolas,Menlo,monospace;white-space:nowrap'>"
                  f"{a(c['serial'] if c.get('has_serial', True) else '-', device_link(c))}</span>",
-                 plan] + [esc(v) or "-" for v in c["fields"].values()] + [canc]
+                 plan] + [esc(values[i]) or "<span style='color:#b0b7c3'>&ndash;</span>" for _, i in extra] + [canc]
         rows.append(f"<tr style='background:{bg}'>" + "".join(f"<td style='{td}'>{x}</td>" for x in cells) + "</tr>")
     more = (f"<p style='font-size:12px;color:#5b6472;margin:6px 0 0'>&hellip; and {len(changes) - ROW_CAP} more "
             f"in the attached report.xlsx.</p>" if len(changes) > ROW_CAP else "")
-    return (f"<div style='overflow-x:auto;margin-top:10px'><table cellpadding='0' cellspacing='0' "
-            f"style='border-collapse:collapse'>"
-            f"<tr>{head}</tr>{''.join(rows)}</table></div>{more}")
+    return (f"<table width='100%' cellpadding='0' cellspacing='0' border='0' "
+            f"style='border-collapse:collapse;width:100%;margin-top:12px'>"
+            f"<tr>{head}</tr>{''.join(rows)}</table>{more}")
 
 
 def source_html(result):
     label = result["label"]
-    head = (f"<h2 style='font-size:17px;margin:26px 0 2px;padding-top:16px;border-top:2px solid #e3e6eb;"
-            f"color:#1f2a37'>{esc(label)}</h2>")
+    head = (f"<h2 style='font-size:17px;margin:28px 0 2px;padding-top:18px;border-top:1px solid #e3e6eb;"
+            f"color:#1f2a37;font-family:Segoe UI,Helvetica,Arial,sans-serif'>{esc(label)}</h2>")
     if result["first_run"]:
         return head + (f"<p style='font-size:13px;color:#5b6472'>No baseline existed for {esc(label)}; created "
                        f"<b>{esc(result['baseline_name'])}</b> with {result['count']:,} devices. Changes will be "
@@ -1110,8 +1127,8 @@ def digest_html(results, when):
         overall = ("<h2 style='font-size:16px;margin:22px 0 2px;color:#1f2a37'>All sources</h2>"
                    + cards_row(all_changes))
     return (f"<html><body style='margin:0;padding:0;background:#eef1f5'>"
-            f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;background:#eef1f5'><tr><td align='center' style='padding:18px 8px'>"
-            f"<table role='presentation' cellpadding='0' cellspacing='0' style='width:100%;max-width:1100px;background:#fff;border-radius:10px;font-family:Segoe UI,Helvetica,Arial,sans-serif;color:#1f2a37'>"
+            f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' border='0' style='width:100%;background:#eef1f5'><tr><td align='center' style='padding:18px 8px'>"
+            f"<table role='presentation' width='{EMAIL_WIDTH}' cellpadding='0' cellspacing='0' border='0' style='width:{EMAIL_WIDTH}px;background:#fff;border-radius:10px;font-family:Segoe UI,Helvetica,Arial,sans-serif;color:#1f2a37'>"
             f"<tr><td style='background:#{BRAND};padding:18px 24px'>"
             f"<div style='font-size:11px;letter-spacing:.12em;color:#c9d4e3;text-transform:uppercase'>Device Billing Update</div>"
             f"<div style='font-size:20px;font-weight:700;color:#fff;margin-top:4px'>{labels} &middot; Daily</div>"
