@@ -583,6 +583,41 @@ def compare(old, new, include_never_activated=False, label="", terminated_plans=
     return changes
 
 
+def flag_duplicates(changes, old, new):
+    """Mark changes whose serial number is not unique, so the reader sees
+    them instead of taking two rows for two devices.
+
+    Two situations, both recorded in c["dup_note"] (and c["dup"] = True):
+      * the same serial appears on more than one row of THIS report (e.g. a
+        ZenduONE device whose old row was deleted and re-created under a new
+        Device_Id shows up once as Terminated and once as a plan change);
+      * the serial sits on more than one device row in the current table
+        (demo/test copies, a device moved between companies without the old
+        row being removed).
+    Changes without a serial are ignored. Returns how many were flagged."""
+    def norm(s):
+        return re.sub(r"[\s\-]", "", str(s or "")).upper()
+
+    in_report = collections.Counter(norm(c["serial"]) for c in changes if c.get("has_serial", True))
+    in_table = collections.Counter(norm(v["serial"]) for v in new.values() if v.get("has_serial", True))
+    flagged = 0
+    for c in changes:
+        c["dup"], c["dup_note"] = False, ""
+        if not c.get("has_serial", True):
+            continue
+        k = norm(c["serial"])
+        if not k:
+            continue
+        notes = []
+        if in_report.get(k, 0) > 1:
+            notes.append(f"{in_report[k]} rows in this report")
+        if in_table.get(k, 0) > 1:
+            notes.append(f"on {in_table[k]} device rows in the current table")
+        if notes:
+            c["dup"], c["dup_note"] = True, "Duplicate serial: " + "; ".join(notes)
+            flagged += 1
+    return flagged
+
 
 # -------------------------------------------------- CRM cancellation requests
 
@@ -834,13 +869,13 @@ def cancel_text(c):
 
 def _row_values(c):
     q = (c.get("cancellations") or [None])[0]
-    return ([KIND_LABEL[c["kind"]], c["customer"], crm_link(c), c["serial"], device_link(c),
-             c["old_plan"], c["new_plan"]] + list(c["fields"].values())
+    return ([KIND_LABEL[c["kind"]], c["customer"], crm_link(c), c["serial"], c.get("dup_note", ""),
+             device_link(c), c["old_plan"], c["new_plan"]] + list(c["fields"].values())
             + [cancel_text(c), q["url"] if q else "", q["ticket_url"] if q else ""])
 
 
 def _row_headers(source):
-    return (["Change", "Customer", "CRM Link", "Serial", "Device Link", "Old Plan", "New Plan"]
+    return (["Change", "Customer", "CRM Link", "Serial", "Duplicate Serial", "Device Link", "Old Plan", "New Plan"]
             + [lab for lab, *_ in source.get("columns", [])]
             + ["Cancellation Request", "Cancellation Link", "Ticket Link"])
 
@@ -882,6 +917,11 @@ def build_xlsx(results):
                 if header in ("CRM Link", "Device Link", "Cancellation Link", "Ticket Link") and v:
                     ws.cell(row=row, column=col_idx).hyperlink = v
                     ws.cell(row=row, column=col_idx).font = Font(color="0563C1", underline="single")
+            if c.get("dup"):
+                # Duplicate serial: amber row so it is not read as two devices.
+                for col_idx in range(1, len(headers) + 1):
+                    ws.cell(row=row, column=col_idx).fill = PatternFill("solid", fgColor="FFF4CE")
+                ws.cell(row=row, column=headers.index("Duplicate Serial") + 1).font = Font(bold=True, color="8A5A00")
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
         for col_idx, header in enumerate(headers, start=1):
@@ -1059,6 +1099,8 @@ def change_table_html(source, changes):
     rows = []
     for i, c in enumerate(changes[:ROW_CAP]):
         bg = "#ffffff" if i % 2 == 0 else "#f7f8fa"
+        if c.get("dup"):
+            bg = "#fff4ce"                                   # amber: duplicate serial
         color = CARD_COLORS[c["kind"]]
         kind = f"<span style='color:{color};font-weight:600;white-space:nowrap'>{KIND_LABEL[c['kind']]}</span>"
         if c["kind"] == "added":
@@ -1082,9 +1124,13 @@ def change_table_html(source, changes):
                 + (f" <span style='color:#8a94a3'>(req {esc(q['requested'])})</span>" if q["requested"] else "")
                 for q in c["cancellations"])
         values = list(c["fields"].values())
-        cells = [kind, a(c["customer"], crm_link(c)),
-                 f"<span style='font-family:Consolas,Menlo,monospace;white-space:nowrap'>"
-                 f"{a(c['serial'] if c.get('has_serial', True) else '-', device_link(c))}</span>",
+        serial = (f"<span style='font-family:Consolas,Menlo,monospace;white-space:nowrap'>"
+                  f"{a(c['serial'] if c.get('has_serial', True) else '-', device_link(c))}</span>")
+        if c.get("dup"):
+            serial += (f"<br><span style='display:inline-block;margin-top:3px;padding:1px 6px;border-radius:3px;"
+                       f"background:#8a5a00;color:#fff;font-size:10px;font-weight:600;white-space:nowrap'>"
+                       f"&#9888; {esc(c['dup_note'])}</span>")
+        cells = [kind, a(c["customer"], crm_link(c)), serial,
                  plan] + [esc(values[i]) or "<span style='color:#b0b7c3'>&ndash;</span>" for _, i in extra] + [canc]
         rows.append(f"<tr style='background:{bg}'>" + "".join(f"<td style='{td}'>{x}</td>" for x in cells) + "</tr>")
     more = (f"<p style='font-size:12px;color:#5b6472;margin:6px 0 0'>&hellip; and {len(changes) - ROW_CAP} more "
@@ -1105,8 +1151,15 @@ def source_html(result):
     if not result["changes"]:
         return head + "<p style='font-size:13px;color:#5b6472'>No device plan changes.</p>"
     n = counts(result["changes"])
+    dups = sum(1 for c in result["changes"] if c.get("dup"))
+    dup_line = ""
+    if dups:
+        dup_line = (f"<div style='font-size:12px;color:#8a5a00;background:#fff4ce;border-left:3px solid #8a5a00;"
+                    f"padding:6px 10px;margin:8px 0 0'>&#9888; {dups} row(s) carry a <b>duplicate serial number</b> "
+                    f"(same serial on more than one row of this report or on more than one device row in the "
+                    f"table). They are shaded amber below &ndash; check before treating them as separate devices.</div>")
     return head + (f"<div style='font-size:12px;color:#5b6472'>{n['customers']} customer(s) affected</div>"
-                   + cards_row(result["changes"])
+                   + cards_row(result["changes"]) + dup_line
                    + change_table_html(result["source"], result["changes"]))
 
 
@@ -1116,7 +1169,8 @@ def digest_html(results, when):
     checked = any(c.get("crm_checked") for c in all_changes)
     intro = (f"Device activations, terminations and plan changes since the previous run, for {labels}. "
              f"Customer names open the Zoho CRM account; serial numbers open the device page where a link is "
-             f"configured. The full breakdown is attached as <b>report.xlsx</b> (one sheet per source).")
+             f"configured. The full breakdown is attached as <b>report.xlsx</b> (one sheet per source); "
+             f"the attached <b>SOP_plan_change.pdf</b> says how to handle each Plan Change row.")
     crm_line = ("Terminated devices were checked against Zoho CRM cancellation requests: the last column shows "
                 "the matching request (reference &middot; ticket &middot; status), or <b style='color:#b3261e'>"
                 "No request found</b>."
@@ -1154,11 +1208,32 @@ def digest_text(results, when):
                      f"({n['no_request']} without a cancellation request)   Plan changes: {n['changed']}")
         for c in r["changes"]:
             extra = f"  [{cancel_text(c)}]" if c["kind"] == "terminated" else ""
+            if c.get("dup"):
+                extra += f"  [{c['dup_note'].upper()}]"
             lines.append(f"  {KIND_LABEL[c['kind']]:<11} {c['serial']}  ({c['customer'] or '-'})  "
                          f"{c['old_plan']} -> {c['new_plan']}{extra}")
         lines.append("")
     lines.append("Full breakdown attached as report.xlsx.")
     return "\n".join(lines)
+
+
+EMAIL_ATTACH = env("EMAIL_ATTACH", "SOP_plan_change.pdf")   # extra files attached to EVERY digest, comma-separated
+
+
+def extra_attachments():
+    """Static files attached to every results email (the plan-change SOP by
+    default). Paths are relative to main.py's folder; a missing file is logged
+    and skipped, never fatal."""
+    out = []
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in [p.strip() for p in EMAIL_ATTACH.split(",") if p.strip()]:
+        path = name if os.path.isabs(name) else os.path.join(base, name)
+        if os.path.isfile(path):
+            with open(path, "rb") as fh:
+                out.append((os.path.basename(path), fh.read()))
+        else:
+            say(f"Attachment {name} not found next to main.py - skipped")
+    return out
 
 
 def email_results(results):
@@ -1175,6 +1250,7 @@ def email_results(results):
     else:
         attachments = [(f"plan_changes_{r['key']}.csv", build_csv(r["source"], r["changes"]))
                        for r in results if r["changes"]]
+    attachments += extra_attachments()
     for r in results:
         if not r["first_run"]:
             n = counts(r["changes"])
@@ -1303,6 +1379,9 @@ def process_source(source, token, include_never):
                       terminated_plans=source.get("terminated_plans", ()))
     for c in changes:
         c["_device_url"] = source.get("device_url", "")
+    dups = flag_duplicates(changes, old, new)
+    if dups:
+        say(f"[{label}] {dups} change(s) carry a serial that appears more than once - highlighted in the report")
     kinds = collections.Counter(c["kind"] for c in changes)
     say(f"[{label}] {len(changes)} change(s): {kinds.get('added', 0)} added, "
         f"{kinds.get('terminated', 0)} terminated, {kinds.get('changed', 0)} plan changes")
