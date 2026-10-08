@@ -2,16 +2,16 @@ name: Device plan check
 
 on:
   schedule:
-    # 13:23 IST every day = 07:53 UTC. GitHub cron is always UTC.
-    # Deliberately NOT on :00 or :30 - those minutes are so busy on GitHub that
-    # scheduled runs there are often delayed by 30+ min or dropped altogether
-    # (which is what happened on the first morning). Odd minutes fire reliably,
-    # so this lands a few minutes before the 1:30 PM IST target.
-    - cron: "53 7 * * *"
-    # Safety net: 14:53 IST = 09:23 UTC. If the 13:23 slot ran and updated the
-    # baselines, this run finds no changes and sends nothing; if GitHub skipped
-    # the first slot, this one does the day's job instead.
-    - cron: "23 9 * * *"
+    # 1:30 PM IST every day = 08:00 UTC. GitHub cron is always UTC.
+    # GitHub starts scheduled runs best-effort: expect a few minutes' delay, and
+    # on-the-hour slots like this one are the busiest, so it is occasionally
+    # skipped altogether.
+    - cron: "0 8 * * *"
+    # Safety net: 1:30 PM IST = 08:13 UTC. If the 1:30 run happened and updated
+    # the baselines, this run finds no changes and sends nothing; if GitHub
+    # skipped the 1:30 slot, this one does the day's job instead. The
+    # concurrency block below makes it wait if the first run is still going.
+    - cron: "13 8 * * *"
   workflow_dispatch:
     inputs:
       include_never_activated:
